@@ -48,8 +48,8 @@ export interface PacketUnit {
   dependencies: string[];
   files: string[];
   approach: string;
-  execution_note?: string;
-  technical_design?: string;
+  execution_note: string | undefined;
+  technical_design: string | undefined;
   patterns: string[];
   test_scenarios: string[];
   /** Requirement definitions referenced by this unit (not just IDs). */
@@ -95,6 +95,7 @@ export function buildWorkerPacket(
     baseSha?: string;
     branch?: string;
     worktreePath?: string;
+    resultFile?: string;
     /** Requirement definitions to inject when plan-parser does not yet extract them. */
     requirementDefs?: { id: string; text: string }[];
     /** KTD excerpts to inject when plan-parser does not yet extract them. */
@@ -127,12 +128,12 @@ export function buildWorkerPacket(
     verification: unit.verification,
   };
 
-  // result_file is derived from worktreePath when present (R3):
-  //   <worktree>/.ce-beads-worker/result.json
+  // result_file: explicit override takes precedence, otherwise derive from worktreePath (R3).
   const result_file =
-    opts.worktreePath != null
+    opts.resultFile ??
+    (opts.worktreePath != null
       ? `${opts.worktreePath.replace(/[\\/]+$/, "")}/.ce-beads-worker/result.json`
-      : null;
+      : null);
 
   return {
     schema_version: PACKET_SCHEMA_VERSION,

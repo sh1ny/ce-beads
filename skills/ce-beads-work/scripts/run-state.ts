@@ -353,35 +353,36 @@ function assertRunState(value: unknown): asserts value is RunState {
     if (!isObject(unit)) {
       throw new RunStateError("RUN_STATE_CORRUPT", `unit ${unitId} must be an object`);
     }
-    assertRunUnitRecord(unit, unitId);
+    assertRunUnitRecord(unit as Record<string, unknown>, unitId);
   }
 }
 
-function assertRunUnitRecord(value: Record<string, unknown>, unitId: string): asserts value is RunUnitRecord {
-  if (typeof value.beads_id !== "string") {
+function assertRunUnitRecord(value: object, unitId: string): asserts value is RunUnitRecord {
+  const v = value as Record<string, unknown>;
+  if (typeof v.beads_id !== "string") {
     throw new RunStateError("RUN_STATE_CORRUPT", `unit ${unitId} beads_id must be a string`);
   }
-  if (!UNIT_STATE_VALUES.has(value.state as UnitRunState)) {
+  if (!UNIT_STATE_VALUES.has(v.state as UnitRunState)) {
     throw new RunStateError("RUN_STATE_CORRUPT", `unit ${unitId} state is invalid`);
   }
   for (const field of ["worker_pane_id", "worker_branch", "worktree_path", "worker_base_sha", "claimed_at", "worker_commit_sha", "merge_sha", "integrated_sha"]) {
-    if (value[field] !== null && typeof value[field] !== "string") {
+    if (v[field] !== null && typeof v[field] !== "string") {
       throw new RunStateError("RUN_STATE_CORRUPT", `unit ${unitId} ${field} must be a string or null`);
     }
   }
-  if (value.result !== null && !isObject(value.result)) {
+  if (v.result !== null && !isObject(v.result)) {
     throw new RunStateError("RUN_STATE_CORRUPT", `unit ${unitId} result must be an object or null`);
   }
-  if (value.last_successful_state !== null && !UNIT_STATE_VALUES.has(value.last_successful_state as UnitRunState)) {
+  if (v.last_successful_state !== null && !UNIT_STATE_VALUES.has(v.last_successful_state as UnitRunState)) {
     throw new RunStateError("RUN_STATE_CORRUPT", `unit ${unitId} last_successful_state is invalid`);
   }
-  if (typeof value.blocker_reason !== "string") {
+  if (typeof v.blocker_reason !== "string") {
     throw new RunStateError("RUN_STATE_CORRUPT", `unit ${unitId} blocker_reason must be a string`);
   }
-  if (!PROMPT_LIFECYCLE_VALUES.has(value.prompt_lifecycle as PromptLifecycle)) {
+  if (!PROMPT_LIFECYCLE_VALUES.has(v.prompt_lifecycle as PromptLifecycle)) {
     throw new RunStateError("RUN_STATE_CORRUPT", `unit ${unitId} prompt_lifecycle is invalid`);
   }
-  if (typeof value.attempt !== "number" || !Number.isSafeInteger(value.attempt) || value.attempt < 1) {
+  if (typeof v.attempt !== "number" || !Number.isSafeInteger(v.attempt) || v.attempt < 1) {
     throw new RunStateError("RUN_STATE_CORRUPT", `unit ${unitId} attempt must be a positive integer`);
   }
 }

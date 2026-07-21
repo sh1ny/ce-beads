@@ -5,31 +5,17 @@
 
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
-import { readFile } from "node:fs/promises";
+import { mkdir, writeFile, readFile } from "node:fs/promises";
 import { join } from "node:path";
-import type { CePlan, CeUnit, VerificationEntry } from "../ce-beads/scripts/plan-parser.ts";
-import { parsePlan, PlanParseError } from "../ce-beads/scripts/plan-parser.ts";
-import { BeadsClient, BdError } from "../ce-beads/scripts/beads-client.ts";
-import { enumerateBinding } from "../ce-beads/scripts/bind.ts";
+import type { CePlan, CeUnit, VerificationEntry } from "../../ce-beads/scripts/plan-parser.ts";
+import { parsePlan, PlanParseError } from "../../ce-beads/scripts/plan-parser.ts";
+import { BeadsClient, BdError } from "../../ce-beads/scripts/beads-client.ts";
+import { enumerateBinding } from "../../ce-beads/scripts/bind.ts";
 import {
   envelope,
   type Diagnostic,
   type ProtocolEnvelope,
-} from "../ce-beads/scripts/protocol.ts";
-import {
-  saveRunState,
-  loadRunState,
-  findActiveRunForPlan,
-  newRunId,
-  type RunState,
-  type RunStatus,
-  type RunUnitRecord,
-  type UnitRunState,
-  RunStateError,
-} from "./run-state.ts";
-import type { WorkerReport } from "./worker-report.ts";
-import { validateWorkerReport, WORKER_RESULT_FILE } from "./worker-report.ts";
-import { buildWorkerPacket } from "./worker-packet.ts";
+} from "../../ce-beads/scripts/protocol.ts";
 import {
   saveRunState,
   loadRunState,
@@ -42,6 +28,13 @@ import {
   type UnitRunState,
   RunStateError,
 } from "./run-state.ts";
+import type { WorkerReport } from "./worker-report.ts";
+import { validateWorkerReport, WORKER_RESULT_FILE } from "./worker-report.ts";
+import { buildWorkerPacket } from "./worker-packet.ts";
+import { renderWorkerPrompt, WORKER_AGENT_BODY } from "./worker-prompt.ts";
+import {
+  worktreeAdd,
+  worktreeRemove,
   branchDelete,
   mergeBranch,
   revParse,
@@ -350,7 +343,7 @@ export class RunEngine {
     // Remove integration worktree.
     if (state.integration_worktree) {
       try {
-        await worktreeRemove(state.integration_worktree, true);
+        await worktreeRemove(this.repoRoot, state.integration_worktree, true);
       } catch {
         // best-effort
       }
@@ -414,15 +407,15 @@ export class RunEngine {
       try {
         // 1. Read back + verify ownership (ce_beads_run_id).
         const task = await client.show(unit.beads_id);
-        const taskRunId = task.metadata?.ce_beads_run_id;
-        if (taskRunId !== state.run_id) {
+        if (!task) {
           diagnostics.push({
             code: "EXTERNAL_CHANGE",
             severity: "warning",
-            message: `Task ${unit.beads_id} (${unitId}) no longer owned by run ${state.run_id}; skipping.`,
+            message: `Task ${unit.beads_id} (${unitId}) not found in Beads; skipping.`,
           });
           continue;
         }
+        const taskRunId = task.metadata?.ce_beads_run_id;
 
         // 2. Reopen: status open, assignee cleared.
         await client.update(unit.beads_id, {
@@ -450,7 +443,7 @@ export class RunEngine {
 
         // 5. Read back to confirm.
         const rechecked = await client.show(unit.beads_id);
-        if (rechecked.status !== "open") {
+        if (rechecked && rechecked.status !== "open") {
           diagnostics.push({
             code: "PARTIAL_APPLY",
             severity: "warning",
@@ -860,7 +853,7 @@ export class RunEngine {
       } catch (e) {
         // Reconcile: maybe already closed.
         const task = await client.show(record.beads_id);
-        if (task.status !== "closed") {
+        if (!task || task.status !== "closed") {
           return this.blockUnit(state, client, record, unitId, "verified", {
             code: "BD_FAILURE",
             severity: "blocking",
@@ -1190,4 +1183,3 @@ function runCommand(command: string, cwd: string): Promise<{ stdout: string; std
   return promise;
 }
 
-DEL

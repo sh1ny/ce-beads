@@ -21,21 +21,21 @@ import {
   type CePlan,
   type CeUnit,
   type VerificationEntry,
-} from "../ce-beads/scripts/plan-parser.ts";
-import { BeadsClient } from "../ce-beads/scripts/beads-client.ts";
-import { enumerateBinding, buildMapping } from "../ce-beads/scripts/bind.ts";
+} from "../../ce-beads/scripts/plan-parser.ts";
+import { BeadsClient } from "../../ce-beads/scripts/beads-client.ts";
+import { enumerateBinding, buildMapping } from "../../ce-beads/scripts/bind.ts";
 import {
   buildWorkerPacket,
   PACKET_SCHEMA_VERSION,
   type PacketUnit,
   type WorkerPacket,
 } from "./worker-packet.ts";
-import type { CliArgs, ActionHandler } from "../ce-beads/scripts/cli.ts";
+import type { CliArgs, ActionHandler } from "../../ce-beads/scripts/cli.ts";
 import {
   envelope,
   type ProtocolEnvelope,
   type Diagnostic,
-} from "../ce-beads/scripts/protocol.ts";
+} from "../../ce-beads/scripts/protocol.ts";
 
 // --- Types -----------------------------------------------------------------
 
@@ -111,6 +111,8 @@ function emptyPacket(): WorkerPacket {
     dependencies: [],
     files: [],
     approach: "",
+    execution_note: undefined,
+    technical_design: undefined,
     patterns: [],
     test_scenarios: [],
     requirement_defs: [],
@@ -218,7 +220,7 @@ async function packetAction(args: CliArgs): Promise<ProtocolEnvelope> {
   );
 
   // 6. Build the packet (standalone: run-context fields null).
-  const packet = buildWorkerPacket(plan, unit, verificationCommands, { beadsId });
+  const packet = buildWorkerPacket(plan, unit, verificationCommands, { ...(beadsId !== null ? { beadsId } : {}) });
 
   return envelope(
     "packet",

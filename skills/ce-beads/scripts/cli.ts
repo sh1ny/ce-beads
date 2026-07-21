@@ -30,39 +30,111 @@ import { handler as doctorHandler } from "./doctor.ts";
 import { handler as bindHandler } from "./bind.ts";
 import { handler as statusHandler } from "./status.ts";
 import { handler as syncHandler } from "./sync.ts";
+import { handler as packetHandler } from "../../ce-beads-work/scripts/packet.ts";
+import { handler as runHandler } from "../../ce-beads-work/scripts/run.ts";
 export interface CliArgs {
   action: Action;
   planPath: string | undefined;
   json: boolean;
   applyToken: string | undefined;
   help: boolean;
+  /** Full positional args (for packet/run subcommands). */
+  positional: string[] | undefined;
+  /** Parsed --flag value map (for packet/run options). */
+  options: Record<string, unknown> | undefined;
+  /** --unit <U-ID> (packet action). */
+  unitId: string | undefined;
+  /** run subcommand: start|status|resume|reap|abandon. */
+  runSub: string | undefined;
+  /** --force (reap). */
+  force: boolean | undefined;
+  /** --retry (resume). */
+  retry: boolean | undefined;
+  /** --once (start/resume). */
+  once: boolean | undefined;
 }
-
+/** Construct a CliArgs with defaults for the new optional fields. */
+export function makeCliArgs(overrides: {
+  action: Action;
+  planPath: string | undefined;
+  json?: boolean;
+  applyToken?: string;
+  help?: boolean;
+}): CliArgs {
+  return {
+    action: overrides.action,
+    planPath: overrides.planPath,
+    json: overrides.json ?? false,
+    applyToken: overrides.applyToken,
+    help: overrides.help ?? false,
+    positional: [],
+    options: {},
+    unitId: undefined,
+    runSub: undefined,
+    force: false,
+    retry: false,
+    once: false,
+  };
+}
 export function parseArgs(argv: string[]): CliArgs {
   const args = argv.slice(2); // skip bun + script path
   if (args.length === 0) {
-    return { action: "doctor", planPath: undefined, json: false, applyToken: undefined, help: true };
+    return { action: "doctor", planPath: undefined, json: false, applyToken: undefined, help: true, positional: [], options: {}, unitId: undefined, runSub: undefined, force: false, retry: false, once: false };
   }
   const action = args[0] as Action;
-  if (!["doctor", "bind", "status", "sync"].includes(action)) {
-    return { action: "doctor", planPath: undefined, json: false, applyToken: undefined, help: true };
+  if (!["doctor", "bind", "status", "sync", "packet", "run"].includes(action)) {
+    return { action: "doctor", planPath: undefined, json: false, applyToken: undefined, help: true, positional: [], options: {}, unitId: undefined, runSub: undefined, force: false, retry: false, once: false };
   }
   let planPath: string | undefined;
   let json = false;
   let applyToken: string | undefined;
   let help = false;
+  let unitId: string | undefined;
+  let runSub: string | undefined;
+  let force = false;
+  let retry = false;
+  let once = false;
+  const positional: string[] = [action];
+  const options: Record<string, unknown> = {};
   for (let i = 1; i < args.length; i++) {
     const arg = args[i]!;
     if (arg === "--json") json = true;
     else if (arg === "--apply") {
       applyToken = args[++i];
+    } else if (arg === "--unit") {
+      unitId = args[++i];
+    } else if (arg === "--force") {
+      force = true;
+    } else if (arg === "--retry") {
+      retry = true;
+    } else if (arg === "--once") {
+      once = true;
     } else if (arg === "--help" || arg === "-h") {
       help = true;
-    } else if (!arg.startsWith("-") && !planPath) {
-      planPath = arg;
+    } else if (!arg.startsWith("-")) {
+      if (!planPath) planPath = arg;
+      positional.push(arg);
+    } else {
+      // Capture --flag value pairs for options bag.
+      const flagName = arg.replace(/^--/, "");
+      const nextVal = args[i + 1];
+      if (nextVal && !nextVal.startsWith("-")) {
+        options[flagName] = nextVal;
+        i++;
+      } else {
+        options[flagName] = true;
+      }
     }
   }
-  return { action, planPath, json, applyToken, help };
+  // For `run`, positional[1] is the subcommand.
+  if (action === "run") {
+    runSub = positional[1];
+  }
+  // R11: reject --force outside reap.
+  if (force && !(action === "run" && runSub === "reap")) {
+    return { action: "doctor", planPath: undefined, json: false, applyToken: undefined, help: true, positional: [], options: {}, unitId: undefined, runSub: undefined, force: false, retry: false, once: false };
+  }
+  return { action, planPath, json, applyToken, help, positional, options, unitId, runSub, force, retry, once };
 }
 
 // --- Output ----------------------------------------------------------------
@@ -111,11 +183,21 @@ export function usageMessage(): string {
     "  doctor [plan-path]   Read-only health report",
     "  bind <plan-path>     Import a plan into Beads (idempotent)",
     "  status <plan-path>   Read-only drift report",
-    "  sync <plan-path>      Reconcile plan changes into Beads",
+    "  sync <plan-path>     Reconcile plan changes into Beads",
+    "  packet <plan-path> --unit <U-ID>  Build a standalone worker packet",
+    "  run start <plan-path> [--once]    Start a new orchestration run",
+    "  run status [run-id]              Show run status",
+    "  run resume <run-id> [--retry]    Resume a blocked/failed run",
+    "  run reap <run-id> [--force] [--apply <token>]  Cleanup panes/worktrees",
+    "  run abandon <run-id> [--apply <token>]        Release Beads tasks",
     "",
     "Flags:",
     "  --json               Machine-readable JSON envelope on stdout",
     "  --apply <token>      Apply a previously-previewed mutation set",
+    "  --unit <U-ID>        Unit ID for the packet action",
+    "  --once               Run one integration cycle then stop",
+    "  --retry              Re-attempt a blocked unit (resume only)",
+    "  --force              Force reap of an in_progress run (reap only)",
     "  --help, -h           Show this help",
     "",
     `Protocol version: ${PROTOCOL_VERSION}`,
@@ -247,7 +329,10 @@ export function verifyApplyToken(
 
 export async function main(argv: string[]): Promise<number> {
   const args = parseArgs(argv);
-  if (args.help || (args.action !== "doctor" && !args.planPath)) {
+  // `run status` doesn't need planPath; everything else (except doctor) does.
+  const needsPlanPath = args.action !== "doctor" &&
+    !(args.action === "run" && args.runSub === "status");
+  if (args.help || (needsPlanPath && !args.planPath && args.action !== "run")) {
     process.stderr.write(usageMessage() + "\n");
     return args.help ? ExitCode.SUCCESS : ExitCode.USAGE;
   }
@@ -257,6 +342,8 @@ export async function main(argv: string[]): Promise<number> {
     bind: bindHandler,
     status: statusHandler,
     sync: syncHandler,
+    packet: packetHandler,
+    run: runHandler,
   };
   const handler = handlers[args.action]!;
   const env = await handler.run(args);

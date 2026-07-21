@@ -16,6 +16,9 @@
 - `orchestrator.ts`: `RunEngine` — serial control loop + 6-state integrate-before-close state machine (claim → worker → capture → verify → merge → verify → close); reap/abandon with preview→apply approval tokens; crash-recovery via persisted run-state; P0-1 worker-base-sha freshness; two-way changed_files equality validation.
 - Test fixtures: `17-work-failing-verification.md` (failing verification command), `18-work-u2-depends-on-u1-impl.md` (P0-1 worker-base-sha freshness), and `worker-reports/` (valid-complete, valid-blocked, invalid-missing-fields, invalid-bad-status, invalid-not-json).
 - `orchestrator.ts`: `RunEngine` — serial control loop + 6-state integrate-before-close state machine (claim → worker → capture → verify → merge → verify → close); reap/abandon with preview→apply approval tokens; crash-recovery via persisted run-state; P0-1 worker-base-sha freshness; two-way changed_files equality validation
+- `runtimes/herdr.ts`: HerdrRuntime — production AgentRuntime using `herdr agent start` with prompt-as-argv (pi-overseer pattern); file-based completion (R3); `herdr agent get` advisory state checks
+- `run.ts`: run action handler — dispatches to RunEngine for start/status/resume/reap/abandon
+- `agents/ce-beads-unit.md`: bundled worker agent file (R9) with restricted tools whitelist
 
 ### Changed
 - `beads-client.ts`: `BeadsClient.update()` now accepts `assignee?: string` (empty string clears assignee; required for abandon contract's `bd update --status open --assignee ""`).
@@ -23,7 +26,24 @@
 - Plan v6: HerdrRuntime spec rewritten to use `herdr agent start` with prompt-as-argv (pi-overseer pattern), eliminating the two-phase startWorker gap; prompt delivered atomically with agent launch.
 - `beads-client.ts`: `BeadsClient.update()` now accepts `assignee?: string` (empty string clears assignee; required for abandon contract's `bd update --status open --assignee "".)
 - `bind.ts`: exported `enumerateBinding` and `buildMapping` for reuse by `packet.ts`
+- `runtimes/herdr.ts`: `HerdrRuntime` — production AgentRuntime using `herdr agent start` with prompt-as-argv (pi-overseer pattern); file-based completion (R3); `herdr agent get` advisory state checks.
+- `run.ts`: `run` action handler — dispatches to RunEngine for start/status/resume/reap/abandon.
+- `agents/ce-beads-unit.md`: bundled worker agent file (R9) with restricted tools whitelist.
+- `cli.ts`: extended for `packet` and `run` actions with positional/options parsing, `--unit`/`--force`/`--retry`/`--once` flags, `makeCliArgs` helper for backward-compatible CliArgs construction.
+- `worker-packet.ts`: `buildWorkerPacket` now accepts `resultFile` override; `PacketUnit` optional fields typed `string | undefined` for exactOptionalPropertyTypes.
+- `run-state.ts`: `assertRunUnitRecord` parameter type changed from `Record<string, unknown>` to `object` with internal cast (TS2677 fix).
+- `beads-client.ts`: `BeadsClient.update()` now accepts `assignee?: string`.
+- `bind.ts`: exported `enumerateBinding` and `buildMapping`.
+- Plan v6: HerdrRuntime spec rewritten to use `herdr agent start` with prompt-as-argv.
+- Test files updated to use `makeCliArgs` helper (status, sync, doctor, bind).
 - Plan v6: HerdrRuntime spec rewritten to use `herdr agent start` with prompt-as-argv (pi-overseer pattern), eliminating the two-phase startWorker gap; prompt delivered atomically with agent launch
+- `cli.ts`: extended for `packet` and `run` actions with positional/options parsing; `--unit`/`--force`/`--retry`/`--once` flags; `makeCliArgs` helper for backward-compatible CliArgs construction
+- `worker-packet.ts`: `buildWorkerPacket` now accepts `resultFile` override; `PacketUnit` optional fields typed `string | undefined` for exactOptionalPropertyTypes
+- `run-state.ts`: `assertRunUnitRecord` parameter type changed from `Record<string, unknown>` to `object` with internal cast (TS2677 fix)
+
+### Fixed
+- Deduplicated repeated entries in unreleased changelog section
+- Test files updated to use `makeCliArgs` helper (status, sync, doctor, bind)
 ## 0.1.0 — 2026-07-21
 ### Added
 

@@ -2,7 +2,7 @@ import { describe, expect, it, beforeEach, afterEach } from "bun:test";
 import { join } from "node:path";
 import { handler } from "../skills/ce-beads/scripts/bind.ts";
 import { BeadsClient } from "../skills/ce-beads/scripts/beads-client.ts";
-import { buildPreview, verifyApplyToken, type CliArgs } from "../skills/ce-beads/scripts/cli.ts";
+import { buildPreview, verifyApplyToken, makeCliArgs, type CliArgs } from "../skills/ce-beads/scripts/cli.ts";
 import {
   setupWorkspace,
   snapshotDevRepo,
@@ -15,13 +15,12 @@ const FIXTURES = join(import.meta.dir, "fixtures", "plans");
 const REPO_ROOT = join(import.meta.dir, "..");
 
 function makeArgs(planPath: string, opts: { json?: boolean; applyToken?: string } = {}): CliArgs {
-  return {
+  return makeCliArgs({
     action: "bind",
     planPath,
     json: opts.json ?? false,
-    applyToken: opts.applyToken,
-    help: false,
-  };
+    ...(opts.applyToken !== undefined ? { applyToken: opts.applyToken } : {}),
+  });
 }
 
 describe("bind: happy path", () => {

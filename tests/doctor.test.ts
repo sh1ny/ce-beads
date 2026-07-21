@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { handler } from "../skills/ce-beads/scripts/doctor.ts";
 import { handler as bindHandler } from "../skills/ce-beads/scripts/bind.ts";
 import type { CliArgs } from "../skills/ce-beads/scripts/cli.ts";
+import { makeCliArgs } from "../skills/ce-beads/scripts/cli.ts";
 import {
   setupWorkspace,
   snapshotDevRepo,
@@ -12,9 +13,8 @@ import {
 } from "./helpers/beads-workspace.ts";
 
 const FIXTURES = join(import.meta.dir, "fixtures", "plans");
-
 function doctorArgs(planPath: string | undefined): CliArgs {
-  return { action: "doctor", planPath, json: true, applyToken: undefined, help: false };
+  return makeCliArgs({ action: "doctor", planPath, json: true });
 }
 
 describe("doctor: happy path", () => {
@@ -79,9 +79,9 @@ describe("doctor: detection", () => {
   it("healthy bound workspace reports binding health pass", async () => {
     // Bind a plan first.
     const planPath = join(FIXTURES, "02-linear-three-unit.md");
-    const preview = await bindHandler.run({ action: "bind", planPath, json: true, applyToken: undefined, help: false });
+    const preview = await bindHandler.run(makeCliArgs({ action: "bind", planPath, json: true }));
     const token = (preview.data as { approvalToken: string }).approvalToken;
-    await bindHandler.run({ action: "bind", planPath, json: true, applyToken: token, help: false });
+    await bindHandler.run(makeCliArgs({ action: "bind", planPath, json: true, applyToken: token }));
 
     const env = await handler.run(doctorArgs(planPath));
     const data = env.data as { checks: Array<{ name: string; status: string }> };

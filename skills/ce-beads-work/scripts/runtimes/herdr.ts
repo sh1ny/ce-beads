@@ -1,0 +1,328 @@
+// runtimes/herdr.ts — production AgentRuntime over the Herdr CLI.
+// Uses `herdr agent start` with the prompt as the LAST argv argument to omp
+// (pi-overseer pattern): the agent starts working immediately, eliminating the
+// two-phase startWorker gap. Completion is file-based (R3); `herdr agent get`
+// is an advisory fast-path only.
+
+import { existsSync } from "node:fs";
+import { readFile } from "node:fs/promises";
+import { join, resolve } from "node:path";
+import { spawn } from "node:child_process";
+import { mkdtemp } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import type { CeUnit } from "../../../ce-beads/scripts/plan-parser.ts";
+import type { RunState } from "../run-state.ts";
+import {
+  WORKER_RESULT_FILE,
+  WORKER_RESULT_TEMP,
+  validateWorkerReport,
+} from "../worker-report.ts";
+import {
+  worktreeAdd,
+  worktreeRemove,
+  branchDelete,
+} from "../git.ts";
+import type {
+  AgentRuntime,
+  CleanupOpts,
+  WaitOpts,
+  WorkerHandle,
+  WorkerResult,
+  WorkerState,
+  Workspace,
+} from "./runtime.ts";
+
+/** Tool whitelist enforced via `omp --tools` (R5). Mirrors the agent file. */
+export const HERDR_WORKER_TOOLS = [
+  "read", "grep", "glob", "bash", "edit", "write", "lsp", "ast_grep",
+] as const;
+
+export interface HerdrRuntimeOptions {
+  /** Repo root the coordinator runs in (for git worktree operations). */
+  repoRoot: string;
+  /** Worktree root; default `${TMPDIR:-/tmp}/ce-beads-wt`. */
+  worktreeRoot?: string;
+  /** Worker model role; default from CE_BEADS_WORKER_MODEL env or "@smol". */
+  model?: string;
+  /** OMP profile; default from CE_BEADS_OMP_PROFILE env or "chinese". */
+  profile?: string;
+  /** herdr binary; default "herdr" (PATH). */
+  herdrPath?: string;
+  /** omp binary; default resolved from PATH or process.execPath. */
+  ompPath?: string;
+  /** Worker wait timeout; default 30 min. */
+  workerTimeoutMs?: number;
+  /** Herdr workspace ID to spawn agents in; defaults to current workspace. */
+  workspaceId?: string;
+}
+
+export class HerdrRuntime implements AgentRuntime {
+  private readonly repoRoot: string;
+  private readonly worktreeRoot: string;
+  private readonly model: string;
+  private readonly profile: string;
+  private readonly herdrPath: string;
+  private readonly ompPath: string;
+  private readonly workspaceId: string | undefined;
+
+  constructor(opts: HerdrRuntimeOptions) {
+    this.repoRoot = opts.repoRoot;
+    this.worktreeRoot = opts.worktreeRoot ?? join(tmpdir(), "ce-beads-wt");
+    this.model = opts.model ?? process.env.CE_BEADS_WORKER_MODEL ?? "@smol";
+    this.profile = opts.profile ?? process.env.CE_BEADS_OMP_PROFILE ?? "chinese";
+    this.herdrPath = opts.herdrPath ?? "herdr";
+    this.ompPath = opts.ompPath ?? resolveOmpBinary();
+    this.workspaceId = opts.workspaceId;
+  }
+
+  async createWorkspace(
+    unit: CeUnit,
+    run: RunState,
+    forkSha: string,
+  ): Promise<Workspace> {
+    const attempt = 1;
+    const slug = `${unit.id}-${run.run_id}-a${attempt}`;
+    const worktreePath = join(this.worktreeRoot, slug);
+    const branch = `ce-beads/${slug}`;
+    await worktreeAdd(this.repoRoot, worktreePath, branch, forkSha);
+    return { unitId: unit.id, worktreePath, branch };
+  }
+
+  async startWorkerPhase1(ws: Workspace): Promise<WorkerHandle> {
+    // Phase 1: no pane created yet. The pane is created in phase 2 by
+    // `herdr agent start` with the prompt as argv. Return a handle with
+    // paneId=null; the engine persists this immediately so a crash between
+    // phase 1 and phase 2 is recoverable (resume re-invokes phase 2).
+    return {
+      paneId: "",
+      workspace: ws,
+      resultFile: join(ws.worktreePath, WORKER_RESULT_FILE),
+      startedAt: new Date().toISOString(),
+      promptLifecycle: "not_sent",
+    };
+  }
+
+  async startWorkerPhase2(handle: WorkerHandle, prompt: string): Promise<void> {
+    const ws = handle.workspace;
+    const agentName = `ce-beads-${ws.unitId}`;
+    const disposableBeadsDir = await mkdtemp(join(tmpdir(), "ce-beads-worker-"));
+
+    const argv: string[] = [
+      this.ompPath,
+      "--profile", this.profile,
+      "--model", this.model,
+      "--no-session",
+      "--tools", HERDR_WORKER_TOOLS.join(","),
+      "--append-system-prompt",
+      join(ws.worktreePath, ".ce-beads-worker", "system-prompt.md"),
+      prompt,
+    ];
+
+    const args: string[] = [
+      "agent", "start", agentName,
+      "--cwd", ws.worktreePath,
+      "--split", "right",
+      "--no-focus",
+      "--env", `BEADS_DIR=${disposableBeadsDir}`,
+      "--", ...argv,
+    ];
+    if (this.workspaceId) {
+      args.splice(4, 0, "--workspace", this.workspaceId);
+    }
+
+    const result = await this.runHerdr(args);
+    const parsed = JSON.parse(result.stdout) as HerdrAgentStartResponse;
+    if (parsed.error) {
+      throw new Error(`herdr agent start failed: ${parsed.error.message}`);
+    }
+    const paneId = parsed.result?.agent?.pane_id;
+    if (!paneId) {
+      throw new Error("herdr agent start returned no pane_id");
+    }
+    handle.paneId = paneId;
+    handle.promptLifecycle = "sent";
+
+    // API key check: read the pane after a short delay for cold-start.
+    await sleep(3000);
+    const readResult = await this.runHerdr([
+      "agent", "read", paneId,
+      "--source", "visible",
+      "--lines", "12",
+    ]);
+    const readParsed = JSON.parse(readResult.stdout) as HerdrAgentReadResponse;
+    const text = readParsed.result?.read?.text ?? "";
+    if (text.includes("No API key found")) {
+      // Close the pane and throw.
+      try {
+        await this.runHerdr(["pane", "close", paneId]);
+      } catch {
+        // best-effort
+      }
+      throw new Error("Worker OMP session has no API key");
+    }
+  }
+
+  async wait(handle: WorkerHandle, opts: WaitOpts): Promise<WorkerResult> {
+    const pollIntervalMs = opts.pollIntervalMs ?? 2000;
+    const deadline = Date.now() + opts.timeoutMs;
+
+    for (;;) {
+      // Deterministic path (R3): check result file existence.
+      if (existsSync(handle.resultFile)) {
+        const raw = await readFile(handle.resultFile, "utf8");
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(raw);
+        } catch {
+          return {
+            kind: "died",
+            reason: "result file present but not valid JSON",
+          };
+        }
+        const validation = validateWorkerReport(parsed);
+        if (validation.ok) {
+          return { kind: "completed", report: validation.report };
+        }
+        return {
+          kind: "died",
+          reason: `result file present but invalid: ${validation.error}`,
+        };
+      }
+
+      // Advisory fast-path: check if pane is dead.
+      if (handle.paneId) {
+        try {
+          const result = await this.runHerdr(["agent", "get", handle.paneId]);
+          const parsed = JSON.parse(result.stdout) as HerdrAgentGetResponse;
+          if (parsed.error) {
+            // Agent not found → died.
+            return { kind: "died", reason: `agent not found: ${parsed.error.message}` };
+          }
+        } catch {
+          // herdr command failed — might be transient, keep polling.
+        }
+      }
+
+      // Check timeout.
+      if (Date.now() >= deadline) {
+        return { kind: "timeout" };
+      }
+
+      await sleep(pollIntervalMs);
+    }
+  }
+
+  async inspect(handle: WorkerHandle): Promise<WorkerState> {
+    if (existsSync(handle.resultFile)) return "finished";
+    if (!handle.paneId) return "unknown";
+    try {
+      const result = await this.runHerdr(["agent", "get", handle.paneId]);
+      const parsed = JSON.parse(result.stdout) as HerdrAgentGetResponse;
+      if (parsed.error) return "dead";
+      const status = parsed.result?.agent?.agent_status;
+      if (status === "working") return "running";
+      if (status === "idle" || status === "done") return "finished";
+      if (status === "blocked") return "dead";
+      return "unknown";
+    } catch {
+      return "dead";
+    }
+  }
+
+  async cleanup(handle: WorkerHandle, opts: CleanupOpts): Promise<void> {
+    const ws = handle.workspace;
+    if (opts.pane === "close" && handle.paneId) {
+      try {
+        await this.runHerdr(["pane", "close", handle.paneId]);
+      } catch {
+        // best-effort
+      }
+    }
+    if (opts.worktree === "remove") {
+      try {
+        await worktreeRemove(this.repoRoot, ws.worktreePath, true);
+      } catch {
+        // best-effort
+      }
+    }
+    if (opts.branch === "remove") {
+      try {
+        await branchDelete(this.repoRoot, ws.branch, true);
+      } catch {
+        // best-effort
+      }
+    }
+  }
+
+  // --- Internal helpers ----------------------------------------------------
+
+  private runHerdr(args: string[]): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+    const { promise, resolve } = Promise.withResolvers<{ stdout: string; stderr: string; exitCode: number }>();
+    const child = spawn(this.herdrPath, args, {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout?.on("data", (d: Buffer) => (stdout += d.toString()));
+    child.stderr?.on("data", (d: Buffer) => (stderr += d.toString()));
+    child.on("close", (code) => resolve({ stdout, stderr, exitCode: code ?? 0 }));
+    child.on("error", (err) => resolve({ stdout, stderr: err.message, exitCode: 1 }));
+    return promise;
+  }
+}
+
+// --- Type helpers for herdr JSON responses --------------------------------
+
+interface HerdrAgentStartResponse {
+  id: string;
+  result?: {
+    type: string;
+    agent?: {
+      pane_id: string;
+      terminal_id: string;
+      workspace_id: string;
+      agent_status: string;
+    };
+  };
+  error?: { code: string; message: string };
+}
+
+interface HerdrAgentGetResponse {
+  id: string;
+  result?: {
+    agent?: {
+      agent_status: string;
+      revision: number;
+      pane_id: string;
+    };
+  };
+  error?: { code: string; message: string };
+}
+
+interface HerdrAgentReadResponse {
+  id: string;
+  result?: {
+    read?: {
+      text: string;
+    };
+  };
+  error?: { code: string; message: string };
+}
+
+// --- Utility functions -----------------------------------------------------
+
+function resolveOmpBinary(): string {
+  // Herdr's spawn PATH may not include ~/.bun/bin. Resolve the full path.
+  // Try process.argv[1] (the running omp binary), then "omp" as fallback.
+  const argv1 = process.argv[1];
+  if (argv1 && argv1.includes("omp")) {
+    return resolve(argv1);
+  }
+  return "omp";
+}
+
+function sleep(ms: number): Promise<void> {
+  const { promise, resolve } = Promise.withResolvers<void>();
+  setTimeout(resolve, ms);
+  return promise;
+}
