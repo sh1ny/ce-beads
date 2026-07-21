@@ -1,3 +1,4 @@
+#!/usr/bin/env bun
 // cli.ts — subcommand dispatch, lock plumbing, and preview/apply flow.
 //
 // Owns subcommand dispatch and the shared machine protocol (KTD15, KTD16).
@@ -104,7 +105,7 @@ export function usageMessage(): string {
   return [
     "ce-beads — bridge CE implementation-ready plans into Beads",
     "",
-    "Usage: bun .omp/skills/ce-beads/scripts/cli.ts <action> [plan-path] [flags]",
+    "Usage: ce-beads <action> [plan-path] [flags]",
     "",
     "Actions:",
     "  doctor [plan-path]   Read-only health report",
