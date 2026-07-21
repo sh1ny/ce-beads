@@ -460,11 +460,16 @@ export class BeadsClient {
       const stdout = err.stdout?.toString() ?? "";
       const stderr = err.stderr?.toString() ?? (e as Error).message;
       const exitCode = err.exitCode ?? -1;
-      // Check for ENOENT (bd binary not found).
-      if (err.code === "ENOENT" || stderr.includes("ENOENT") || (e as Error).message.includes("ENOENT")) {
+      // Check for bd binary not found (ENOENT via spawn, "command not found" via Bun.$).
+      if (
+        err.code === "ENOENT" ||
+        stderr.includes("ENOENT") ||
+        (e as Error).message.includes("ENOENT") ||
+        (exitCode === 1 && stderr.includes("command not found"))
+      ) {
         throw new BdError(
           "bd_missing",
-          `bd binary not found at '${this.bdPath}' (ENOENT)`,
+          `bd binary not found at '${this.bdPath}' (ENOENT${exitCode === 1 && stderr.includes("command not found") ? "/command-not-found" : ""})`,
           (e as Error).message,
           exitCode,
           `bd ${args.join(" ")}`,

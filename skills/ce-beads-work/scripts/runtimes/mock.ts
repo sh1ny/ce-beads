@@ -184,7 +184,7 @@ class MockRuntime implements AgentRuntime {
         // Branch deletion must run from the main repo, not the worktree
         // (worktree is gone now, and even if not, git refuses to delete
         // the checked-out branch). Tests run from the repo root.
-        await Bun.$`git branch -D ${ws.branch}`.cwd(process.cwd()).quiet();
+        await Bun.$`git -C ${process.cwd()} branch -D ${ws.branch}`.quiet();
       } catch {
         // best-effort
       }
