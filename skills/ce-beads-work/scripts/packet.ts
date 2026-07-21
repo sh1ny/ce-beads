@@ -22,10 +22,8 @@ import {
   type CeUnit,
   type VerificationEntry,
 } from "../ce-beads/scripts/plan-parser.ts";
-import {
-  BeadsClient,
-  loadBinding,
-} from "../ce-beads/scripts/beads-client.ts";
+import { BeadsClient } from "../ce-beads/scripts/beads-client.ts";
+import { enumerateBinding, buildMapping } from "../ce-beads/scripts/bind.ts";
 import {
   buildWorkerPacket,
   PACKET_SCHEMA_VERSION,
@@ -196,16 +194,14 @@ async function packetAction(args: CliArgs): Promise<ProtocolEnvelope> {
   // 4. Resolve beadsId from binding (if any). Binding lookup is read-only.
   //    Beads failures (BD_MISSING, BD_FAILURE) surface as a warning and the
   //    packet still builds with beadsId=null — a planning repo without an
-  //    initialized Beads workspace must not block packet emission.
   let beadsId: string | null = null;
   let bdWarning: Diagnostic | null = null;
   const beadsDir = process.env.BEADS_DIR ?? join(repoRoot, ".beads");
   try {
     const client = new BeadsClient({ beadsDir });
-    const binding = await loadBinding(client, plan.path);
-    if (binding) {
-      beadsId = binding.beadsIdByUnitId[unitId] ?? null;
-    }
+    const binding = await enumerateBinding(client, plan.path);
+    const mapping = buildMapping(plan, binding);
+    beadsId = mapping[unitId] ?? null;
   } catch (e) {
     if ((e as { name?: string }).name === "BdError") {
       bdWarning = {
@@ -217,9 +213,6 @@ async function packetAction(args: CliArgs): Promise<ProtocolEnvelope> {
       throw e;
     }
   }
-
-  // 5. Filter verification commands to this unit. The contract is fanned
-  //    out per U-ID at parse time (R8), so this is a straight filter.
   const verificationCommands: VerificationEntry[] = plan.verification_commands.filter(
     (v) => v.unit_id === unitId,
   );

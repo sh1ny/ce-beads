@@ -13,11 +13,17 @@
 - `worker-report.ts`: `WorkerReport` schema (`ce-beads-worker-report/1`), strict structural validation, fallback pane-output JSON extraction.
 - `run-state.ts`: `RunState`/`RunUnitRecord` with 6-state unit lifecycle (`pending→claimed→worker_finished→captured→merged→verified→closed`, with `blocked`), crash recovery via `last_successful_state` + `prompt_lifecycle`, atomic file persistence, `findActiveRunForPlan` (mid-initialization detection).
 - `git.ts`: minimal git helper functions (worktree add/remove, branch delete, merge with conflict detection, diff-stat, porcelain status, atomic add+commit) using `node:child_process`.
+- `orchestrator.ts`: `RunEngine` — serial control loop + 6-state integrate-before-close state machine (claim → worker → capture → verify → merge → verify → close); reap/abandon with preview→apply approval tokens; crash-recovery via persisted run-state; P0-1 worker-base-sha freshness; two-way changed_files equality validation.
 - Test fixtures: `17-work-failing-verification.md` (failing verification command), `18-work-u2-depends-on-u1-impl.md` (P0-1 worker-base-sha freshness), and `worker-reports/` (valid-complete, valid-blocked, invalid-missing-fields, invalid-bad-status, invalid-not-json).
-- `packet.ts`: packet action handler for standalone worker packet building
-- `runtimes/mock.ts`: MockRuntime for deterministic CI testing with real git worktrees
-- `worker-prompt.ts`: WORKER_AGENT_BODY system prompt and renderWorkerPrompt function
-- Test fixtures for failing verification and worker report validation
+- `orchestrator.ts`: `RunEngine` — serial control loop + 6-state integrate-before-close state machine (claim → worker → capture → verify → merge → verify → close); reap/abandon with preview→apply approval tokens; crash-recovery via persisted run-state; P0-1 worker-base-sha freshness; two-way changed_files equality validation
+
+### Changed
+- `beads-client.ts`: `BeadsClient.update()` now accepts `assignee?: string` (empty string clears assignee; required for abandon contract's `bd update --status open --assignee ""`).
+- `bind.ts`: exported `enumerateBinding` and `buildMapping` for reuse by `packet.ts`.
+- Plan v6: HerdrRuntime spec rewritten to use `herdr agent start` with prompt-as-argv (pi-overseer pattern), eliminating the two-phase startWorker gap; prompt delivered atomically with agent launch.
+- `beads-client.ts`: `BeadsClient.update()` now accepts `assignee?: string` (empty string clears assignee; required for abandon contract's `bd update --status open --assignee "".)
+- `bind.ts`: exported `enumerateBinding` and `buildMapping` for reuse by `packet.ts`
+- Plan v6: HerdrRuntime spec rewritten to use `herdr agent start` with prompt-as-argv (pi-overseer pattern), eliminating the two-phase startWorker gap; prompt delivered atomically with agent launch
 ## 0.1.0 — 2026-07-21
 ### Added
 

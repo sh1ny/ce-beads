@@ -689,9 +689,10 @@ export interface AgentRuntime {
 
 ```ts
 // runtimes/herdr.ts — production runtime over the Herdr CLI.
-// Follows skill://herdr-omp-model-launch: split → rename → launch →
-// poll agent detection → welcome-screen API-key check → send prompt →
-// file-based completion observation (R3).
+// Uses `herdr agent start` with the prompt as the LAST argv argument to
+// omp — the agent starts working immediately, eliminating the two-phase
+// startWorker gap. Completion is still file-based (R3); `herdr agent wait`
+// is an advisory fast-path only.
 
 export interface HerdrRuntimeOptions {
   /** Repo root the coordinator runs in (for git worktree operations). */
@@ -704,6 +705,8 @@ export interface HerdrRuntimeOptions {
   profile?: string;
   /** herdr binary; default "herdr" (PATH). */
   herdrPath?: string;
+  /** omp binary; default resolved from process.argv[1] or "omp" (PATH). */
+  ompPath?: string;
   /** Worker wait timeout; default 30 min. */
   workerTimeoutMs?: number;
 }
@@ -712,11 +715,6 @@ export interface HerdrRuntimeOptions {
 export const HERDR_WORKER_TOOLS = [
   "read", "grep", "glob", "bash", "edit", "write", "lsp", "ast_grep",
 ] as const;
-/*
- * This list is the single source of truth. The agent file frontmatter
- * `tools:` list and the CLI `--tools` argument use the identical list. If
- * omp rejects a tool name, both are updated together — they never diverge.
- */
 
 export class HerdrRuntime implements AgentRuntime {
   constructor(opts: HerdrRuntimeOptions);
@@ -729,73 +727,70 @@ export class HerdrRuntime implements AgentRuntime {
 }
 ```
 
-The constructor resolves `profile = opts.profile ?? process.env.CE_BEADS_OMP_PROFILE ?? "chinese"` and `model = opts.model ?? process.env.CE_BEADS_WORKER_MODEL ?? "@smol"`.
+The constructor resolves `profile = opts.profile ?? process.env.CE_BEADS_OMP_PROFILE ?? "chinese"`, `model = opts.model ?? process.env.CE_BEADS_WORKER_MODEL ?? "@smol"`, and `ompPath = opts.ompPath ?? resolveOmpBinary()` (resolves the full path to the omp binary, since Herdr's spawn PATH may not include ~/.bun/bin).
 
 Implementation contract (exact command sequences; every herdr invocation
 parses the `{"id":…,"result":…}` JSON envelope):
 
+**[v6 SIMPLIFICATION — pi-overseer pattern]** The two-phase startWorker
+is preserved for the interface (MockRuntime still uses it), but
+HerdrRuntime's `startWorkerPhase1` + `startWorkerPhase2` are collapsed
+into a single `herdr agent start` call that delivers the prompt as the
+last argv argument to omp. The prompt is delivered atomically with agent
+launch — no gap between pane creation and prompt delivery. Phase1 creates
+the workspace + returns a handle with `promptLifecycle = "not_sent"` (no
+pane yet). Phase2 calls `herdr agent start` with the prompt as argv and
+sets `promptLifecycle = "sent"`.
+
 - `createWorkspace`: `git worktree add <worktreeRoot>/<U-ID>-<run-id>-a<N>
   -b ce-beads/<U-ID>-<run-id>-a<N> <forkSha>` where `<N>` is the attempt
-  number (starts at 1, increments on each retry). This prevents worktree
-  path collisions when retry re-launches a worker (the previous attempt's
-  worktree is preserved per P1-5). Old worktrees are archived, not
-  overwritten. The engine tracks the current attempt number in
-  RunUnitRecord (add `attempt: number` field, default 1).
-  Then `mkdir .ce-beads-worker/` inside the worktree, remove any stale
-  `result.json` and `.result.tmp` so neither exists, and return the
-  `Workspace` (`unitId`, `worktreePath`, `branch`). It does NOT write
-  `system-prompt.md` or `packet.json` — the engine writes both after
-  building the packet in loop step 4f. The worker creates `.result.tmp`,
-  writes it, and renames it to `result.json`; the adapter polls for
-  `result.json` existence (R3).
+  number. Then `mkdir .ce-beads-worker/` inside the worktree, remove any
+  stale `result.json` and `.result.tmp`. Returns Workspace. Does NOT write
+  `system-prompt.md` or `packet.json` — the engine writes both before
+  calling startWorkerPhase2.
 - `startWorkerPhase1(ws)`:
-  1. `herdr pane split --current --direction right --no-focus` → parse
-     `result.pane_id` (fall back to `result.pane?.pane_id` and `down`
-     direction on failure — field name verified at build time, defensive
-     parse always).
-  2. `herdr pane rename <pane_id> "ce-beads-<U-ID>-<run-id>"`.
-  3. `herdr pane run <pane_id> 'cd <worktree> && export
-     BEADS_DIR="$(mktemp -d)" && export PATH="<sanitized-PATH-without-bd>" &&
-     omp --profile <resolved-profile> --model <resolved-model> --no-session --tools
-     read,grep,glob,bash,edit,write,lsp,ast_grep --append-system-prompt
-     <worktree>/.ce-beads-worker/system-prompt.md'` (R5: isolated
-     `BEADS_DIR`, sanitized `PATH`, and NO `@` prefix on the absolute
-     system-prompt path).
-  4. Poll `herdr pane get <pane_id>` up to 20s until
-     `result.pane.agent` is non-null (cold-start tolerance — the skill
-     documents 5–10s).
-  5. `herdr pane read <pane_id> --source visible --lines 12`; if it contains
-     `No API key found` → close pane, throw (caller maps to
-     `RUNTIME_FAILURE` → outcome `failed`).
-  6. Return WorkerHandle with paneId set, promptLifecycle = "not_sent".
-     The engine persists pane_id IMMEDIATELY.
+  1. Return WorkerHandle with paneId=null, resultFile=<worktree>/.ce-beads-worker/result.json,
+     promptLifecycle="not_sent". No pane created yet — the pane is created
+     in phase 2 by `herdr agent start`.
 - `startWorkerPhase2(handle, prompt)`:
-  1. `herdr pane send-text <pane_id> '<rendered prompt>'` then
-     `herdr pane send-keys <pane_id> enter` (pane send-text delivers the
-     text to the pane's input; send-keys enter submits it. Do NOT use
-     `herdr pane run` — that executes a shell command, not a prompt to
-     the OMP session. Prompt includes the result-file path; see §3.)
-  2. Set handle.promptLifecycle = "sent". Return.
+  1. `herdr agent start "ce-beads-<U-ID>-<run-id>"
+     --cwd <worktree>
+     --workspace <current-workspace-id>
+     --split right --no-focus
+     --env BEADS_DIR=<mktemp-disposable-dir>
+     -- <ompPath> --profile <resolved-profile> --model <resolved-model>
+     --no-session
+     --tools read,grep,glob,bash,edit,write,lsp,ast_grep
+     --append-system-prompt <worktree>/.ce-beads-worker/system-prompt.md
+     '<prompt>'` (R5: isolated BEADS_DIR via --env, NO `@` prefix on the
+     absolute system-prompt path, prompt is the LAST argv argument to omp).
+  2. Parse the `{"result":{"agent":{"pane_id":…}}}` response to extract
+     pane_id. Set handle.paneId = pane_id, handle.promptLifecycle = "sent".
+  3. The agent is now running with the prompt already queued — no
+     send-text/send-keys needed. The prompt was delivered atomically with
+     launch.
+  4. API key check: `herdr agent read <pane_id> --source visible --lines 12`;
+     if it contains `No API key found` → close pane, throw (caller maps to
+     `RUNTIME_FAILURE` → outcome `failed`).
 - `wait`: loop until `opts.timeoutMs`:
   - **Deterministic path (authoritative, R3):** check
     `fs.existsSync(handle.resultFile)`. If present, read + validate via
     `validateWorkerReport`. On valid → `{ kind: "completed", report }`. On
-    invalid → `{ kind: "died", reason: "result file present but invalid" }`
-    (engine maps to `WORKER_REPORT_INVALID`, blocked).
-  - **Advisory fast-path:** `herdr pane get <pane_id>`; if pane missing
-    before result file exists → `{ kind: "died", reason: <stderr> }`. If
-    `agent_status === "idle"` for a sustained period AND the result file
+    invalid → `{ kind: "died", reason: "result file present but invalid" }`.
+  - **Advisory fast-path:** `herdr agent get <handle.paneId>`; if agent
+    not found before result file exists → `{ kind: "died", reason: <stderr> }`.
+    If `agent_status === "idle"` for a sustained period AND the result file
     is absent, log a warning but keep polling (lifecycle lags; the file is
     the truth).
-- `inspect`: `herdr pane get` → pane missing → `dead`; result file exists
-  → `finished`; `agent_status === "working"` → `running`; else `unknown`.
+- `inspect`: `herdr agent get <handle.paneId>` → agent not found → `dead`;
+  result file exists → `finished`; `agent_status === "working"` → `running`;
+  else `unknown`.
 - `cleanup`: per `CleanupOpts`:
   - `opts.pane === "close"`: `herdr pane close <handle.paneId>` (best-effort).
   - `opts.worktree === "remove"`: `git worktree remove --force <path>`.
   - `opts.branch === "remove"`: `git branch -D <branch>`.
   - `opts.worktree === "preserve"` and `opts.branch === "preserve"`: do
-    nothing (leave for human inspection). Only used for failed/blocked
-    units or non-force reap.
+    nothing (leave for human inspection).
 ### 2.6 `orchestrator.ts` — the RunEngine
 
 ```ts

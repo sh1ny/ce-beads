@@ -351,6 +351,8 @@ export class BeadsClient {
     removeLabel?: string[];
     claim?: boolean;
     status?: string;
+    /** Assignee; empty string clears the assignee (requires --status to take effect). */
+    assignee?: string;
   }): Promise<BeadsIssue> {
     const args = ["update", issueId, "--json"];
     if (params.description) args.push("--description", params.description);
@@ -368,6 +370,7 @@ export class BeadsClient {
     }
     if (params.claim) args.push("--claim");
     if (params.status) args.push("--status", params.status);
+    if (params.assignee !== undefined) args.push("--assignee", params.assignee);
     const out = await this.runJson<BeadsIssue[] | BeadsIssue>(args);
     return Array.isArray(out) ? out[0]! : out;
   }
