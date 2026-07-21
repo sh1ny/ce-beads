@@ -421,12 +421,14 @@ export class RunEngine {
         }
         const taskRunId = task.metadata?.ce_beads_run_id;
 
-        // Skip tasks that don't belong to this run (another run claimed them).
-        if (taskRunId && taskRunId !== state.run_id) {
+        // Skip tasks that don't belong to this run. A missing
+        // ce_beads_run_id is also an external change — it means another
+        // process cleared or corrupted the metadata (ce-beads-thread-SwF8U).
+        if (!taskRunId || taskRunId !== state.run_id) {
           diagnostics.push({
             code: "EXTERNAL_CHANGE",
             severity: "warning",
-            message: `Task ${unit.beads_id} (${unitId}) is owned by run ${taskRunId}, not ${state.run_id}; skipping.`,
+            message: `Task ${unit.beads_id} (${unitId}) is not owned by run ${state.run_id} (metadata: ${taskRunId ?? "missing"}); skipping.`,
           });
           continue;
         }
@@ -647,8 +649,33 @@ export class RunEngine {
         worktreePath: record.worktree_path,
         branch: record.worker_branch,
       };
-      // Clear any stale result file from a previous attempt (R3).
-      await rm(join(ws.worktreePath, WORKER_RESULT_FILE), { force: true });
+      // If the worker already wrote a valid result file (crash during
+      // wait()), don't delete it and relaunch — read it and advance to
+      // worker_finished directly (ce-beads-thread-SwF8T, P1).
+      const resultFile = join(ws.worktreePath, WORKER_RESULT_FILE);
+      if (existsSync(resultFile)) {
+        try {
+          const raw = await readFile(resultFile, "utf8");
+          const parsed = JSON.parse(raw);
+          const validation = validateWorkerReport(parsed);
+          if (validation.ok && validation.report.u_id === unitId) {
+            // Valid report for this unit — accept it without relaunching.
+            record.result = validation.report;
+            record.state = "worker_finished";
+            record.last_successful_state = "claimed";
+            await client.update(beadsId, {
+              setMetadata: { ce_beads_run_state: "worker_finished" },
+              addLabel: ["ce-beads:worker-finished"],
+            });
+            saveRunState(state, this.repoRoot);
+            return { kind: "finished" };
+          }
+        } catch {
+          // Invalid result file — fall through to clear and relaunch.
+        }
+      }
+      // Clear any stale/invalid result file from a previous attempt (R3).
+      await rm(resultFile, { force: true });
     } else {
       const forkSha = await revParse(state.integration_worktree, "HEAD");
       record.worker_base_sha = forkSha;
@@ -779,8 +806,6 @@ export class RunEngine {
     return blocked;
   }
 
-  // --- INTEGRATE (6-state machine) ----------------------------------------
-
   private async integrate(
     plan: CePlan,
     client: BeadsClient,
@@ -791,8 +816,6 @@ export class RunEngine {
     const record = state.units[unitId]!;
 
     // 5a. If claimed (resume/retry before the worker finished) → (re)launch
-    // the worker and wait for its report (ce-beads-7i7). Without this branch
-    // a claimed unit falls through and resume hot-loops forever.
     if (record.state === "claimed") {
       const dispatch = await this.dispatchWorker(plan, client, state, unitId, record.beads_id);
       if (dispatch.kind === "blocked") return dispatch;
@@ -811,7 +834,10 @@ export class RunEngine {
             const raw = await readFile(resultFile, "utf8");
             const parsed = JSON.parse(raw);
             const validation = validateWorkerReport(parsed);
-            if (validation.ok) {
+            // Re-validate u_id on the reloaded report — a stale/wrong-unit
+            // result file must not overwrite record.result
+            // (ce-beads-thread-SwF8W).
+            if (validation.ok && validation.report.u_id === unitId) {
               record.result = validation.report;
             }
           } catch {
