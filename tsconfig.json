@@ -19,7 +19,7 @@
     "forceConsistentCasingInFileNames": true
   },
   "include": [
-    ".omp/skills/ce-beads/scripts/**/*.ts",
+    "skills/ce-beads/scripts/**/*.ts",
     "tests/**/*.ts"
   ]
 }

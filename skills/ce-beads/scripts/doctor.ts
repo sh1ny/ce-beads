@@ -12,6 +12,7 @@
 
 import { readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { CliArgs, ActionHandler } from "./cli.ts";
 import type { ProtocolEnvelope, Diagnostic } from "./protocol.ts";
 import { envelope } from "./protocol.ts";
@@ -50,7 +51,8 @@ export const handler: ActionHandler = {
       });
 
       // 2. Version check against UPSTREAMS.lock.json.
-      const lockPath = join(repoRoot, "UPSTREAMS.lock.json");
+      // UPSTREAMS.lock.json is package-owned: resolve relative to this module, never cwd.
+      const lockPath = fileURLToPath(new URL("../../../UPSTREAMS.lock.json", import.meta.url));
       if (existsSync(lockPath)) {
         const lock = JSON.parse(readFileSync(lockPath, "utf8")) as { tools?: { bd?: { version?: string } } };
         const testedVersion = lock.tools?.bd?.version;

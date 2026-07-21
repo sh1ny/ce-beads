@@ -1,9 +1,9 @@
 import { describe, expect, it, beforeEach, afterEach } from "bun:test";
 import { join } from "node:path";
-import { handler as bindHandler } from "../.omp/skills/ce-beads/scripts/bind.ts";
-import { handler as statusHandler } from "../.omp/skills/ce-beads/scripts/status.ts";
-import { BeadsClient } from "../.omp/skills/ce-beads/scripts/beads-client.ts";
-import type { CliArgs } from "../.omp/skills/ce-beads/scripts/cli.ts";
+import { handler as bindHandler } from "../skills/ce-beads/scripts/bind.ts";
+import { handler as statusHandler } from "../skills/ce-beads/scripts/status.ts";
+import { BeadsClient } from "../skills/ce-beads/scripts/beads-client.ts";
+import type { CliArgs } from "../skills/ce-beads/scripts/cli.ts";
 import {
   setupWorkspace,
   snapshotDevRepo,

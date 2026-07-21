@@ -6,7 +6,7 @@ import { spawnSync } from "node:child_process";
 const REPO_ROOT = join(import.meta.dir, "..");
 const README = readFileSync(join(REPO_ROOT, "README.md"), "utf8");
 const ACCEPTANCE = readFileSync(join(REPO_ROOT, "docs/acceptance.md"), "utf8");
-const SKILL = readFileSync(join(REPO_ROOT, ".omp/skills/ce-beads/SKILL.md"), "utf8");
+const SKILL = readFileSync(join(REPO_ROOT, "skills/ce-beads/SKILL.md"), "utf8");
 
 describe("docs: completeness", () => {
   it("docs name each of the four actions", () => {
@@ -43,15 +43,18 @@ describe("docs: completeness", () => {
   });
 
   it("every script path referenced in SKILL.md exists under the skill directory", () => {
-    const scriptRefs = SKILL.match(/\.omp\/skills\/ce-beads\/scripts\/[\w.]+/g) ?? [];
+    const scriptRefs = SKILL.match(/\$SKILL_DIR\/([\w./-]+)/g) ?? [];
     for (const ref of scriptRefs) {
-      const path = join(REPO_ROOT, ref);
+      const rel = ref.replace("$SKILL_DIR/", "");
+      const path = join(REPO_ROOT, "skills/ce-beads", rel);
       expect(existsSync(path)).toBe(true);
     }
+    // The captured set must include the CLI entry point.
+    expect(scriptRefs.some((r) => r.endsWith("scripts/cli.ts"))).toBe(true);
   });
 
   it("mapping.md names every metadata key the builder emits", () => {
-    const mapping = readFileSync(join(REPO_ROOT, ".omp/skills/ce-beads/references/mapping.md"), "utf8");
+    const mapping = readFileSync(join(REPO_ROOT, "skills/ce-beads/references/mapping.md"), "utf8");
     const requiredKeys = [
       "integration", "ce_plan_path", "ce_plan_digest", "ce_artifact_contract",
       "ce_unit_ids", "ce_unit_id", "ce_unit_digest", "ce_requirements", "ce_dependencies",
@@ -62,7 +65,7 @@ describe("docs: completeness", () => {
   });
 
   it("reconciliation.md names every drift class and blocking state", () => {
-    const recon = readFileSync(join(REPO_ROOT, ".omp/skills/ce-beads/references/reconciliation.md"), "utf8");
+    const recon = readFileSync(join(REPO_ROOT, "skills/ce-beads/references/reconciliation.md"), "utf8");
     const driftClasses = [
       "unchanged", "new-in-plan", "missing-in-beads", "content-changed",
       "dependencies-changed", "removed-from-plan", "closed-but-changed",
@@ -75,7 +78,7 @@ describe("docs: completeness", () => {
   });
 
   it("acceptance.md names the launch command, prompt, and isolated workspace", () => {
-    expect(ACCEPTANCE).toContain("omp --profile ce-beads-test");
+    expect(ACCEPTANCE).toContain("omp --profile ce-beads-plugin-test");
     expect(ACCEPTANCE).toContain("--no-skills");
     expect(ACCEPTANCE).toContain("doctor");
     expect(ACCEPTANCE).toContain("bind");
@@ -83,16 +86,41 @@ describe("docs: completeness", () => {
     expect(ACCEPTANCE).toContain("BEADS_DIR");
     expect(ACCEPTANCE).toContain("mktemp -d");
     expect(ACCEPTANCE).toContain("disposable");
+    // Approval-flow boundary: human turn between preview and apply.
+    expect(ACCEPTANCE).toContain("STOP");
+    expect(ACCEPTANCE).toContain("Do not approve");
+    expect(ACCEPTANCE).toContain("user's behalf");
+    expect(ACCEPTANCE).toContain("wait for explicit human approval");
+    expect(ACCEPTANCE).toContain("Do not rerun");
+    expect(ACCEPTANCE).toContain("different token");
+    expect(ACCEPTANCE).toContain("exact token from the displayed preview");
     // Recorded acceptance result must be present.
     expect(ACCEPTANCE).toContain("Recorded acceptance result");
     expect(ACCEPTANCE).toContain("PASS");
+  });
+
+  it("SKILL.md enforces the approval-flow boundary and token preservation", () => {
+    // The initial request to bind is not approval to apply.
+    expect(SKILL).toContain("approval to apply");
+    // Must STOP after preview — no continuing to --apply in the same turn.
+    expect(SKILL).toContain("STOP");
+    expect(SKILL).toContain("same turn");
+    // Never approve on the user's behalf.
+    expect(SKILL).toContain("Never approve on the user's behalf");
+    // Preserve the exact token — never rerun to capture a token.
+    expect(SKILL).toContain("Preserve the exact token");
+    expect(SKILL).toContain("Never rerun");
+    // Token recomputation produces a different token (bold markdown splits the word).
+    expect(SKILL).toMatch(/new.*preview.*different.*token/);
+    // Explicit human approval required.
+    expect(SKILL).toContain("explicit human approval");
   });
 });
 
 describe("docs: smoke test", () => {
   it("doctor --help exits zero", () => {
     const result = spawnSync("bun", [
-      join(REPO_ROOT, ".omp/skills/ce-beads/scripts/cli.ts"),
+      join(REPO_ROOT, "skills/ce-beads/scripts/cli.ts"),
       "doctor",
       "--help",
     ], { cwd: REPO_ROOT, timeout: 10000 });
@@ -101,7 +129,7 @@ describe("docs: smoke test", () => {
 
   it("cli.ts with no args shows usage", () => {
     const result = spawnSync("bun", [
-      join(REPO_ROOT, ".omp/skills/ce-beads/scripts/cli.ts"),
+      join(REPO_ROOT, "skills/ce-beads/scripts/cli.ts"),
     ], { cwd: REPO_ROOT, timeout: 10000, encoding: "utf8" });
     // No args → help=true → exit 0.
     expect(result.status).toBe(0);
@@ -116,7 +144,7 @@ describe("docs: smoke test", () => {
 // the only sanctioned place for machine-specific paths.
 describe("docs: published-file hygiene", () => {
   const EXCLUDED_DIRS = new Set([".git", "node_modules", "upstream", ".beads", "tmp"]);
-  const EXCLUDED_FILES = new Set(["docs/local-environment.md", "tests/docs.test.ts"]);
+  const EXCLUDED_FILES = new Set(["docs/local-environment.md", "tests/docs.test.ts", "tests/packaging.test.ts"]);
   const isExcluded = (rel: string): boolean => {
     if (EXCLUDED_FILES.has(rel)) return true;
     const parts = rel.split("/");
@@ -150,7 +178,7 @@ describe("docs: published-file hygiene", () => {
     { name: "Windows home path (C:\\Users\\)", re: /C:\\\\?Users\\\\?/i },
     { name: "mise install path", re: /\.local\/share\/mise\/installs\// },
     { name: ".bun/bin path", re: /\.bun\/bin\// },
-    { name: "/usr/bin binary path", re: /\/usr\/bin\// },
+    { name: "/usr/bin binary path", re: /\/usr\/bin\/(?!env[\s\/])/ },
     { name: "generic absolute binary_path", re: /"binary_path"\s*:/ },
     { name: "generic absolute path field", re: /"absolute_path"\s*:/ },
     { name: "API key / token assignment", re: /\b(api[_-]?key|secret|password|access[_-]?token)\s*[:=]\s*['"][^'"]{8,}/i },

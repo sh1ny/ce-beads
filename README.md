@@ -4,10 +4,13 @@ OMP-native bridge that imports Compound Engineering implementation-ready plans i
 
 ## Prerequisites
 
-- **WSL/Linux** (tested on WSL2 with Linux 6.18)
+- **Linux/WSL** (tested on WSL2 with Linux 6.18)
 - **Bun** 1.3.14+ (scripts run directly under Bun; no build step)
-- **OMP** 17.0.5+ (for skill discovery)
 - **bd** 1.1.0 (Beads CLI — installed via the official checksum-verifying path)
+- **OMP** 17.0.5+ (for skill discovery)
+
+**No Compound Engineering installation is required** at runtime. The skill
+parses CE plan Markdown directly and writes to Beads via the `bd` CLI.
 
 Verify your environment:
 
@@ -17,15 +20,65 @@ bun --version   # 1.3.14
 omp --version   # omp/17.0.5
 ```
 
-## Setup
+## Install as an OMP plugin
+
+**GitHub** (after the repository is published):
 
 ```bash
-# From the project root:
-bun install --frozen-lockfile
-
-# Initialize the development Beads workspace:
-bd init --non-interactive --init-if-missing --skip-agents --skip-hooks --stealth
+omp plugin install github:OWNER/ce-beads#v0.1.0
 ```
+
+`OWNER` is a placeholder; the real owner and URL are filled in when you create
+the GitHub repository.
+
+**Local development from a checkout:**
+
+```bash
+omp plugin link .
+# equivalently: omp install .   (local paths route to link)
+```
+
+Links are symlinks — source edits take effect without reinstall.
+
+**Profile note (load-bearing):** plugins install into the **active profile's**
+plugin store (`~/.omp/profiles/<name>/plugins` for named profiles, `~/.omp/plugins`
+for the default). Prefix plugin commands with `OMP_PROFILE=<name>` so the
+profile you launch actually sees the plugin.
+
+**Discovery fact:** installed plugins contribute `skills/<name>/SKILL.md` from
+the package root; a valid plugin package needs only a package.json `omp` object
+and that skill tree.
+
+## Manage the plugin
+
+```bash
+omp plugin list                       # human-readable
+omp plugin list --json                # machine-readable
+omp plugin doctor                     # health checks
+omp plugin doctor --json
+
+# update: re-install with a new git ref (moves the pin)
+omp plugin install github:OWNER/ce-beads#<new-ref>
+
+# linked checkouts need no update — source edits flow through the symlink
+omp plugin uninstall ce-beads
+```
+
+## Skill vs standalone CLI
+
+**Inside OMP:** invoke `/skill:ce-beads` and follow the skill — the agent
+runs `bun "$SKILL_DIR/scripts/cli.ts" …` itself, where `SKILL_DIR` is the
+absolute skill directory OMP injects in the `[Skill directory: …]` line.
+
+**Outside OMP:** the same four actions are a plain CLI:
+
+```bash
+ce-beads <action> [plan-path] [flags]                 # bin shim (created on install)
+bun skills/ce-beads/scripts/cli.ts …                  # from a checkout
+```
+
+Run it with the **consumer project** as cwd — the CE plan and the Beads
+workspace (`.beads` or `$BEADS_DIR`) live there, never in the package.
 
 ## Architecture
 
@@ -45,17 +98,20 @@ CE plan Markdown → plan-parser.ts → CePlan/CeUnit IR
 
 ```bash
 # Read-only health check
-bun .omp/skills/ce-beads/scripts/cli.ts doctor [plan-path] [--json]
+ce-beads doctor [plan-path] [--json]
 
 # Import a plan into Beads (idempotent)
-bun .omp/skills/ce-beads/scripts/cli.ts bind <plan-path> [--json] [--apply <token>]
+ce-beads bind <plan-path> [--json] [--apply <token>]
 
 # Read-only drift report
-bun .omp/skills/ce-beads/scripts/cli.ts status <plan-path> [--json]
+ce-beads status <plan-path> [--json]
 
 # Reconcile plan changes into Beads
-bun .omp/skills/ce-beads/scripts/cli.ts sync <plan-path> [--json] [--apply <token>]
+ce-beads sync <plan-path> [--json] [--apply <token>]
 ```
+
+Inside OMP, the same actions run as `bun "$SKILL_DIR/scripts/cli.ts" …` (see
+the skill's `SKILL.md`).
 
 ### Supported CE contract
 
@@ -71,7 +127,7 @@ Rejected: requirements-only, knowledge-work, HTML, legacy contracts, duplicate U
 - Identity: canonical plan path + stable U-ID (stored as metadata, never titles)
 - Metadata: all string-valued (KTD10), with `ce_plan_digest` on the epic and `ce_unit_digest` per task
 
-See `.omp/skills/ce-beads/references/mapping.md` for the full metadata key reference.
+See `skills/ce-beads/references/mapping.md` for the full metadata key reference.
 
 ## Idempotency and reconciliation
 
@@ -80,7 +136,7 @@ See `.omp/skills/ce-beads/references/mapping.md` for the full metadata key refer
 - **sync** is conservative: creates new units, updates open units, labels removed units (never deletes), treats closed-unit changes as conflicts
 - **Recovery is checkpointless**: all state derives from plan + Beads metadata; a fresh rerun converges
 
-See `.omp/skills/ce-beads/references/reconciliation.md` for drift classes and blocking states.
+See `skills/ce-beads/references/reconciliation.md` for drift classes and blocking states.
 
 ## Failure and recovery
 
@@ -96,13 +152,24 @@ See `.omp/skills/ce-beads/references/reconciliation.md` for drift classes and bl
 bun test --timeout 30000        # all tests
 bun test tests/plan-parser.test.ts  # parser only
 bun run typecheck               # tsc --noEmit (strict)
+bun run verify                  # typecheck + test
 ```
 
 Tests exercise the real `bd` CLI in isolated `BEADS_DIR` temp workspaces. The development repository's real `.beads` database is never touched.
 
+## Distribution
+
+The package ships exactly `skills/`, `README.md`, `UPSTREAMS.lock.json` (the
+npm `files` allowlist) plus `package.json`; `tests/`, `docs/`, `upstream/`,
+`.beads/` are excluded. Upstream checkouts are **provenance only**.
+
+**Marketplace installation is not yet provided.** Pre-publication decisions
+still open: public license and GitHub repository metadata.
+
 ## Clean-profile acceptance test
 
-See `docs/acceptance.md` for the exact procedure to validate the deliverable with a fresh OMP profile.
+See `docs/acceptance.md` for the exact procedure to validate the **installed
+plugin** from an unrelated consumer project.
 
 ## Known MVP limitations
 
@@ -111,7 +178,7 @@ See `docs/acceptance.md` for the exact procedure to validate the deliverable wit
 - `bd` CLI only (no direct Dolt, no Beads MCP)
 - Single-writer (no multi-agent concurrent Beads writers)
 - No PR/CI gates
-- No npm package or marketplace plugin
+- Marketplace installation is not yet provided (direct Git/npm install only)
 
 ## Pinned upstreams and tool versions
 
@@ -120,4 +187,4 @@ See `UPSTREAMS.lock.json` for:
 - `beads` commit `1823f47ae42c93cb753536dfc49fa2337ace8eb1`
 - Tested: `bd` 1.1.0, Bun 1.3.14, OMP 17.0.5, Node 24.18.0
 
-The upstream checkouts (`upstream/compound-engineering-plugin`, `upstream/beads`) are **implementation provenance** — read-only references used during development to target the CE plan schema and the `bd` CLI surface. They are gitignored and **not required at runtime**: the skill invokes the `bd` binary from PATH and never reads the upstream trees. `UPSTREAMS.lock.json` intentionally omits machine-specific paths (binary locations, local DB/workspace state); a local environment report, if present, lives at `docs/local-environment.md` (gitignored).
+The upstream checkouts (`upstream/compound-engineering-plugin`, `upstream/beads`) are **implementation provenance** — read-only references used during development to target the CE plan schema and the `bd` CLI surface. They are gitignored and **not required at runtime**: the skill invokes the `bd` binary from PATH and never reads the upstream trees. `UPSTREAMS.lock.json` intentionally omits machine-specific paths (binary locations, local DB/workspace state).

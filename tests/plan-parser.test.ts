@@ -6,7 +6,7 @@ import {
   PlanParseError,
   computePlanDigest,
   resolvePlanPath,
-} from "../.omp/skills/ce-beads/scripts/plan-parser.ts";
+} from "../skills/ce-beads/scripts/plan-parser.ts";
 
 const FIXTURES = join(import.meta.dir, "fixtures", "plans");
 const REPO_ROOT = join(import.meta.dir, "..");

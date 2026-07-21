@@ -12,7 +12,7 @@ import {
   BeadsClient,
   createIsolatedWorkspace,
   type IsolatedWorkspace,
-} from "../../.omp/skills/ce-beads/scripts/beads-client.ts";
+} from "../../skills/ce-beads/scripts/beads-client.ts";
 
 const REPO_ROOT = join(import.meta.dir, "..", "..");
 

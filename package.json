@@ -1,13 +1,35 @@
 {
   "name": "ce-beads",
   "version": "0.1.0",
-  "private": true,
   "type": "module",
   "description": "OMP-native bridge that imports Compound Engineering implementation-ready plans into a Beads dependency graph.",
   "packageManager": "bun@1.3.14",
+  "bin": {
+    "ce-beads": "skills/ce-beads/scripts/cli.ts"
+  },
+  "files": [
+    "skills/",
+    "README.md",
+    "UPSTREAMS.lock.json"
+  ],
+  "engines": {
+    "bun": ">=1.3.14"
+  },
+  "os": ["linux"],
+  "keywords": [
+    "omp-plugin",
+    "agent-skill",
+    "compound-engineering",
+    "beads"
+  ],
+  "omp": {
+    "name": "ce-beads",
+    "description": "Bridge Compound Engineering implementation-ready plans into Beads dependency graphs."
+  },
   "scripts": {
     "test": "bun test --timeout 30000",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "verify": "bun run typecheck && bun run test"
   },
   "devDependencies": {
     "@types/bun": "1.3.14",

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { join } from "node:path";
-import { parsePlan } from "../.omp/skills/ce-beads/scripts/plan-parser.ts";
+import { parsePlan } from "../skills/ce-beads/scripts/plan-parser.ts";
 import {
   buildGraph,
   nodeKey,
@@ -11,7 +11,7 @@ import {
   unitDigest,
   renderUnitDescription,
   type GraphApplyNode,
-} from "../.omp/skills/ce-beads/scripts/graph-builder.ts";
+} from "../skills/ce-beads/scripts/graph-builder.ts";
 
 const FIXTURES = join(import.meta.dir, "fixtures", "plans");
 const REPO_ROOT = join(import.meta.dir, "..");

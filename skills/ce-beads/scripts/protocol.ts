@@ -207,6 +207,10 @@ export function exitCodeFor(
   // Token mismatch.
   if (diagnostics.some((d) => d.code === "TOKEN_MISMATCH")) return ExitCode.CONFLICT;
 
+  // Preview is success (exit 0) — it's not a failure, even if it carries an
+  // info-level PARTIAL_APPLY diagnostic telling the user to re-run with --apply.
+  if (outcome === "preview") return ExitCode.SUCCESS;
+
   // Partial / indeterminate.
   if (outcome === "partial") return ExitCode.PARTIAL;
   if (diagnostics.some((d) => d.code === "PARTIAL_APPLY")) return ExitCode.PARTIAL;
@@ -221,9 +225,6 @@ export function exitCodeFor(
 
   // bd failure.
   if (diagnostics.some((d) => d.code === "BD_FAILURE")) return ExitCode.BD_FAILURE;
-
-  // Preview is success (exit 0) — it's not a failure.
-  if (outcome === "preview") return ExitCode.SUCCESS;
 
   // Ordinary drift / issues_found / healthy / unchanged / bound / already_bound / applied.
   if (hasBlocking || hasError) return ExitCode.CONFLICT;

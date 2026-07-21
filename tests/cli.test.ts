@@ -6,7 +6,7 @@ import {
   LockHolder,
   buildPreview,
   verifyApplyToken,
-} from "../.omp/skills/ce-beads/scripts/cli.ts";
+} from "../skills/ce-beads/scripts/cli.ts";
 import {
   PROTOCOL_VERSION,
   ExitCode,
@@ -14,7 +14,7 @@ import {
   computeApprovalToken,
   type MutationEntry,
   type ApprovalPayload,
-} from "../.omp/skills/ce-beads/scripts/protocol.ts";
+} from "../skills/ce-beads/scripts/protocol.ts";
 
 describe("cli: dispatch", () => {
   it("each subcommand dispatches", () => {

@@ -6,7 +6,7 @@ import {
   BeadsClient,
   BdError,
   createIsolatedWorkspace,
-} from "../.omp/skills/ce-beads/scripts/beads-client.ts";
+} from "../skills/ce-beads/scripts/beads-client.ts";
 import {
   setupWorkspace,
   snapshotDevRepo,

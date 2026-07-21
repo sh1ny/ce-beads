@@ -38,6 +38,25 @@
         "internal/types/types.go",
         "internal/beads/beads.go"
       ]
+    },
+    "oh-my-pi": {
+      "repo": "https://github.com/can1357/oh-my-pi",
+      "commit": "89d6a8f6d14286f32f09ec9c8aa8af7b3451d2d6",
+      "commit_subject": "fix(coding-agent): gate print-mode plan arming on settings before session context",
+      "source_package_version": "17.0.6",
+      "runtime_required": false,
+      "purpose": "Implementation provenance. The inspected contract files defined the OMP plugin contract this package targets: installed-plugin enumeration under the profile plugins root, skills/<name>/SKILL.md scanning with required description, the package.json omp manifest field, /skill invocation with injected absolute Skill directory, and skill:// resource resolution. Inspected from an external read-only checkout; not vendored in this repository and not read at runtime.",
+      "inspected_contract_files": [
+        "docs/skills.md",
+        "docs/skills/authoring-extensions.md",
+        "docs/skills/authoring-marketplaces.md",
+        "docs/extension-loading.md",
+        "packages/coding-agent/src/discovery/omp-extension-roots.ts",
+        "packages/coding-agent/src/discovery/omp-plugins.ts",
+        "packages/coding-agent/src/extensibility/plugins/loader.ts",
+        "packages/coding-agent/src/extensibility/plugins/types.ts",
+        "packages/coding-agent/src/commands/install.ts"
+      ]
     }
   },
   "tools": {
@@ -51,7 +70,7 @@
       "discovery": "on PATH"
     },
     "omp": {
-      "version": "17.0.5",
+      "version": "17.0.6",
       "discovery": "on PATH"
     },
     "node": {
