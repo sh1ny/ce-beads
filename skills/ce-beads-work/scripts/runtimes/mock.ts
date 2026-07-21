@@ -7,6 +7,7 @@
 // the commit (identical to the production HerdrRuntime path). This ensures CI
 // exercises the real commit/integration code, not a mock shortcut.
 
+import { execFileSync } from "node:child_process";
 import { mkdir, rename, writeFile, readFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -19,7 +20,7 @@ import {
   WORKER_RESULT_TEMP,
   validateWorkerReport,
 } from "../worker-report.ts";
-import { worktreeAdd, worktreeRemove, branchDelete } from "../git.ts";
+import { worktreeAdd } from "../git.ts";
 import type {
   AgentRuntime,
   CleanupOpts,
@@ -146,7 +147,8 @@ class MockRuntime implements AgentRuntime {
       }
       // Check timeout.
       const elapsed = hrtime(start);
-      if (elapsed >= timeoutNs) {
+      const elapsedMs = elapsed[0] * 1000 + elapsed[1] / 1_000_000;
+      if (elapsedMs >= opts.timeoutMs) {
         // If the script was "die", report a death; otherwise timeout.
         const entry = this.script[handle.workspace.unitId];
         if (entry && entry.report === "die") {
@@ -169,18 +171,23 @@ class MockRuntime implements AgentRuntime {
     // opts.pane === "close" is a no-op for mock (no real pane).
     if (opts.worktree === "remove") {
       try {
-        await worktreeRemove(ws.worktreePath, true);
+        // git worktree remove works with the worktree path as cwd.
+        execFileSync("git", ["worktree", "remove", "--force", ws.worktreePath], { stdio: "ignore" });
       } catch {
         // best-effort; worktree may already be gone
       }
     }
     if (opts.branch === "remove") {
       try {
-        await branchDelete(ws.worktreePath, ws.branch, true);
+        // Branch deletion needs the main repo, not the worktree.
+        // Use execFileSync with -D flag.
+        execFileSync("git", ["branch", "-D", ws.branch], {
+          cwd: handle.workspace.worktreePath,
+          stdio: "ignore",
+        });
       } catch {
         // best-effort
       }
     }
   }
 }
-DEL

@@ -118,7 +118,21 @@ export class RunEngine {
       throw e;
     }
 
-    // 2. Verify binding (NOT_BOUND refusal if unbound).
+    // 2. Refuse on active run for the plan (RUN_ACTIVE) — check BEFORE binding
+    //    so a second start while a run is in_progress is refused even if the
+    //    Beads workspace state changed since the run started.
+    const activeRun = findActiveRunForPlan(plan.path, this.repoRoot);
+    if (activeRun) {
+      return envelope("run", false, "refused", null, [
+        {
+          code: "RUN_ACTIVE",
+          severity: "blocking",
+          message: `Run ${activeRun.run_id} is already active for plan ${plan.path}.`,
+        },
+      ]);
+    }
+
+    // 3. Verify binding (NOT_BOUND refusal if unbound).
     const client = new BeadsClient({ beadsDir: this.beadsDir });
     let binding;
     try {
@@ -139,18 +153,6 @@ export class RunEngine {
           code: "NOT_BOUND",
           severity: "blocking",
           message: `Plan ${plan.path} is not bound to Beads. Run 'ce-beads bind' first.`,
-        },
-      ]);
-    }
-
-    // 3. Refuse on active run for the plan (RUN_ACTIVE).
-    const activeRun = findActiveRunForPlan(plan.path, this.repoRoot);
-    if (activeRun) {
-      return envelope("run", false, "refused", null, [
-        {
-          code: "RUN_ACTIVE",
-          severity: "blocking",
-          message: `Run ${activeRun.run_id} is already active for plan ${plan.path}.`,
         },
       ]);
     }
@@ -542,6 +544,7 @@ export class RunEngine {
       }
 
       record.state = "claimed";
+      record.beads_id = readyTask.beadsId;
       record.claimed_at = new Date().toISOString();
       record.attempt = record.attempt || 1;
       saveRunState(state, this.repoRoot);
@@ -913,7 +916,7 @@ export class RunEngine {
       last_successful_state: null,
       blocker_reason: "",
       prompt_lifecycle: "not_sent",
-      attempt: 0,
+      attempt: 1,
     };
   }
 

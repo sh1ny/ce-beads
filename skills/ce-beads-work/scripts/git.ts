@@ -10,9 +10,9 @@
 // All paths are absolute filesystem paths. `repoRoot` is the primary
 // working tree; `dir` arguments (e.g. worktree paths) are run with their
 // own cwd so commands resolve correctly inside a linked worktree.
-import { spawn } from "node:child_process";
+import { spawn, execFileSync, execSync } from "node:child_process";
 import { mkdir } from "node:fs/promises";
-import { dirname } from "node:path";
+import { dirname, resolve } from "node:path";
 
 /** Result of any successful `git` invocation we bother to capture. */
 export interface GitResult {
@@ -33,26 +33,21 @@ export interface MergeResult {
  * distinguish "expected non-zero" (e.g. `rev-parse` on a missing ref,
  * merge with conflicts) from "the process is on fire".
  */
-export function runInDir(dir: string, args: string[]): Promise<GitResult> {
-  const { promise, resolve, reject } = Promise.withResolvers<GitResult>();
-  const child = spawn("git", args, {
-    cwd: dir,
-    env: process.env,
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-  let stdout = "";
-  let stderr = "";
-  child.stdout.on("data", (chunk: Buffer) => {
-    stdout += chunk.toString();
-  });
-  child.stderr.on("data", (chunk: Buffer) => {
-    stderr += chunk.toString();
-  });
-  child.on("error", reject);
-  child.on("close", (code) => {
-    resolve({ stdout, stderr, exitCode: code ?? -1 });
-  });
-  return promise;
+export async function runInDir(dir: string, args: string[]): Promise<GitResult> {
+  // Use Bun.$ shell to avoid Bun's posix_spawn ENOENT bug that occurs
+  // after many process spawns in the same Bun process (Bun 1.3.x).
+  // Bun.$ uses a different spawning mechanism that is more resilient.
+  try {
+    const proc = Bun.$`git ${args}`.cwd(dir).quiet();
+    const result = await proc;
+    return { stdout: result.stdout.toString(), stderr: result.stderr.toString(), exitCode: result.exitCode };
+  } catch (e) {
+    const err = e as { stdout?: Uint8Array; stderr?: Uint8Array; exitCode?: number; message?: string };
+    const stdout = err.stdout?.toString() ?? "";
+    const stderr = err.stderr?.toString() ?? err.message ?? (e as Error).message;
+    const exitCode = err.exitCode ?? -1;
+    return { stdout, stderr, exitCode };
+  }
 }
 
 /**
@@ -193,15 +188,20 @@ export async function gitCommonDir(repoRoot: string): Promise<string> {
       `git rev-parse --git-common-dir exited ${res.exitCode}: ${res.stderr.trim()}`,
     );
   }
-  return res.stdout.trim();
+  // `git rev-parse --git-common-dir` may return a relative path (e.g., `.git`)
+  // when run in a non-worktree repo. Resolve to absolute so downstream paths
+  // (worktree dirs under it) work regardless of the process CWD.
+  return resolve(repoRoot, res.stdout.trim());
 }
 
-/** `git status --porcelain=v1 -z` — NUL-delimited, machine-friendly. */
+/** `git status --porcelain=v1 -z -uall` — NUL-delimited, machine-friendly.
+ * `-uall` is essential: without it git collapses untracked files under a
+ * directory into a single `?? dir/` entry, which breaks per-file validation. */
 export async function statusPorcelain(repoRoot: string): Promise<string> {
-  const res = await runInDir(repoRoot, ["status", "--porcelain=v1", "-z"]);
+  const res = await runInDir(repoRoot, ["status", "--porcelain=v1", "-z", "-uall"]);
   if (res.exitCode !== 0) {
     throw new Error(
-      `git status --porcelain=v1 -z exited ${res.exitCode}: ${res.stderr.trim()}`,
+      `git status --porcelain=v1 -z -uall exited ${res.exitCode}: ${res.stderr.trim()}`,
     );
   }
   return res.stdout;

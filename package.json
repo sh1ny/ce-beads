@@ -18,6 +18,7 @@
   },
   "files": [
     "skills/",
+    "agents/",
     "README.md",
     "UPSTREAMS.lock.json"
   ],

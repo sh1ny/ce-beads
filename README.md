@@ -90,6 +90,8 @@ CE plan Markdown → plan-parser.ts → CePlan/CeUnit IR
 
 ## Actions
 
+### ce-beads (plan → Beads import)
+
 ```bash
 # Read-only health check
 ce-beads doctor [plan-path] [--json]
@@ -103,6 +105,32 @@ ce-beads status <plan-path> [--json]
 # Reconcile plan changes into Beads
 ce-beads sync <plan-path> [--json] [--apply <token>]
 ```
+
+### ce-beads-work (plan → executed work via worker agents)
+
+```bash
+# Build a bounded worker packet for one unit (read-only, no Beads writes)
+ce-beads packet <plan-path> <U-ID> [--json]
+
+# Start a serial orchestrator run that drives all units to completion
+ce-beads run start <plan-path> [--json]
+ce-beads run resume <plan-path> [--retry] [--once] [--json]
+
+# Preview cleanup of crashed/orphaned runs
+ce-beads run reap <plan-path> [--force] [--apply <token>] [--json]
+
+# Release Beads task ownership for a run
+ce-beads run abandon <plan-path> [--apply <token>] [--json]
+
+# Show run status
+ce-beads run status <run-id-or-plan-path> [--json]
+```
+
+The orchestrator launches one Herdr-backed OMP worker per unit (serially),
+integrates each worker's changes into a dedicated integration branch, runs
+verification, and closes the Beads task **only after** the unit is merged
+and verified (integrate-before-close invariant). State is persisted to
+`$GIT_DIR/ce-beads/` for crash recovery.
 
 Inside OMP, the same actions run as `bun "$SKILL_DIR/scripts/cli.ts" …` (see
 the skill's `SKILL.md`).
@@ -153,9 +181,10 @@ Tests exercise the real `bd` CLI in isolated `BEADS_DIR` temp workspaces. The de
 
 ## Distribution
 
-The package ships exactly `skills/`, `README.md`, `UPSTREAMS.lock.json` (the
-npm `files` allowlist) plus `package.json`; `tests/`, `docs/`, `upstream/`,
-`.beads/` are excluded. Upstream checkouts are **provenance only**.
+The package ships exactly `skills/`, `agents/`, `README.md`,
+`UPSTREAMS.lock.json` (the npm `files` allowlist) plus `package.json`;
+`tests/`, `docs/`, `upstream/`, `.beads/` are excluded. Upstream checkouts
+are **provenance only**.
 
 Marketplace installation is not yet provided (direct Git/npm install only).
 
