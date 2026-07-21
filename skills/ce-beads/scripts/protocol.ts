@@ -19,7 +19,7 @@ export const PROTOCOL_VERSION = "ce-beads-protocol/1" as const;
 
 // --- Actions ---------------------------------------------------------------
 
-export type Action = "doctor" | "bind" | "status" | "sync";
+export type Action = "doctor" | "bind" | "status" | "sync" | "packet" | "run";
 
 // --- Outcomes (per-action closed enums) -------------------------------------
 
@@ -28,7 +28,21 @@ export type BindOutcome = "bound" | "already_bound" | "binding_drift" | "preview
 export type StatusOutcome = "unchanged" | "drift" | "blocked";
 export type SyncOutcome = "preview" | "applied" | "partial" | "blocked" | "refused";
 
-export type Outcome = DoctorOutcome | BindOutcome | StatusOutcome | SyncOutcome;
+export type PacketOutcome = "packet_built" | "unit_not_found";
+
+export type RunOutcome =
+  | "in_progress"
+  | "awaiting_integration"
+  | "completed"
+  | "blocked"
+  | "failed"
+  | "reaped"
+  | "abandoned"
+  | "preview"
+  | "not_found"
+  | "refused";
+
+export type Outcome = DoctorOutcome | BindOutcome | StatusOutcome | SyncOutcome | PacketOutcome | RunOutcome;
 
 // --- Exit codes (KTD15 taxonomy) -------------------------------------------
 
@@ -66,7 +80,21 @@ export type DiagnosticCode =
   | "LOCK_BUSY"
   | "BD_FAILURE"
   | "READBACK_FAILURE"
-  | "PARTIAL_APPLY";
+  | "PARTIAL_APPLY"
+  | "UNIT_NOT_FOUND"
+  | "NOT_BOUND"
+  | "RUN_ACTIVE"
+  | "RUN_NOT_FOUND"
+  | "RUN_STATE_CORRUPT"
+  | "WORKER_FAILED"
+  | "WORKER_REPORT_INVALID"
+  | "WORKER_BLOCKED"
+  | "VERIFICATION_FAILED"
+  | "INTEGRATION_FAILED"
+  | "CHANGED_FILES_INVALID"
+  | "RUNTIME_FAILURE"
+  | "PLAN_DIGEST_DRIFT"
+  | "EXTERNAL_CHANGE";
 
 export interface Diagnostic {
   code: DiagnosticCode;
@@ -225,6 +253,20 @@ export function exitCodeFor(
 
   // bd failure.
   if (diagnostics.some((d) => d.code === "BD_FAILURE")) return ExitCode.BD_FAILURE;
+
+  // New diagnostic mappings (packet/run).
+  if (diagnostics.some((d) => d.code === "NOT_BOUND")) return ExitCode.PRECONDITION;
+  if (diagnostics.some((d) => d.code === "UNIT_NOT_FOUND")) return ExitCode.USAGE;
+  if (diagnostics.some((d) => d.code === "RUN_NOT_FOUND")) return ExitCode.USAGE;
+  if (diagnostics.some((d) => d.code === "RUN_STATE_CORRUPT")) return ExitCode.CONFLICT;
+  if (diagnostics.some((d) => d.code === "PLAN_DIGEST_DRIFT")) return ExitCode.CONFLICT;
+  if (diagnostics.some((d) => d.code === "CHANGED_FILES_INVALID")) return ExitCode.CONFLICT;
+  if (diagnostics.some((d) => d.code === "EXTERNAL_CHANGE")) return ExitCode.CONFLICT;
+  if (diagnostics.some((d) => d.code === "RUNTIME_FAILURE")) return ExitCode.BD_FAILURE;
+
+  // Run outcome mappings.
+  if (outcome === "failed") return ExitCode.PARTIAL;
+  if (outcome === "not_found") return ExitCode.USAGE;
 
   // Ordinary drift / issues_found / healthy / unchanged / bound / already_bound / applied.
   if (hasBlocking || hasError) return ExitCode.CONFLICT;
