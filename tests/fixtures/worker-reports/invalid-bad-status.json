@@ -1,0 +1,11 @@
+{
+  "schema_version": "ce-beads-worker-report/1",
+  "u_id": "U1",
+  "status": "unexpected",
+  "changed_files": ["src/u1.ts"],
+  "verification_evidence": {
+    "commands": ["bun test"],
+    "results": "passed"
+  },
+  "blockers": ""
+}

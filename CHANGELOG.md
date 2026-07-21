@@ -6,17 +6,18 @@
 - ce-beads-work serial orchestrator foundation (in progress): protocol extended with `packet` and `run` actions, `PacketOutcome`/`RunOutcome` enums, and 14 new diagnostic codes (`UNIT_NOT_FOUND` through `EXTERNAL_CHANGE`) with corresponding `exitCodeFor` mappings.
 - Plan parser extended: parses Verification Contract tables into typed `VerificationEntry[]`, requirement definitions (`R-ID` → text) into `requirement_defs`, and KTD excerpts per unit.
 - `worker-packet.ts`: bounded `WorkerPacket` schema (`ce-beads-packet/1`) with `buildWorkerPacket()` — assembles unit, verification commands, requirement defs, and KTD excerpts into a single self-contained worker payload.
+- `packet.ts`: `packet` action handler — standalone packet builder (read-only, no Beads mutation) resolving binding + verification commands for a single unit.
 - `runtimes/runtime.ts`: `AgentRuntime` interface — pluggable worker runtime contract (two-phase `startWorkerPhase1`/`Phase2`, file-based completion wait, crash-recovery `inspect`, preview-gated `cleanup` with separate pane/worktree/branch actions).
+- `runtimes/mock.ts`: `MockRuntime` — scripted, deterministic AgentRuntime for CI; real git worktrees, no Herdr/OMP; does NOT commit (engine's CAPTURE step does, matching production path).
+- `worker-prompt.ts`: `WORKER_AGENT_BODY` (verbatim ce-beads-unit system prompt) + `renderWorkerPrompt()` for pane delivery.
 - `worker-report.ts`: `WorkerReport` schema (`ce-beads-worker-report/1`), strict structural validation, fallback pane-output JSON extraction.
 - `run-state.ts`: `RunState`/`RunUnitRecord` with 6-state unit lifecycle (`pending→claimed→worker_finished→captured→merged→verified→closed`, with `blocked`), crash recovery via `last_successful_state` + `prompt_lifecycle`, atomic file persistence, `findActiveRunForPlan` (mid-initialization detection).
 - `git.ts`: minimal git helper functions (worktree add/remove, branch delete, merge with conflict detection, diff-stat, porcelain status, atomic add+commit) using `node:child_process`.
-- ce-beads-work serial orchestrator foundation (in progress): protocol extended with `packet` and `run` actions, `PacketOutcome`/`RunOutcome` enums, and 14 new diagnostic codes (`UNIT_NOT_FOUND` through `EXTERNAL_CHANGE`) with corresponding `exitCodeFor` mappings
-- Plan parser extended: parses Verification Contract tables into typed `VerificationEntry[]`, requirement definitions (`R-ID` -> text) into `requirement_defs`, and KTD excerpts per unit
-- `worker-packet.ts`: bounded `WorkerPacket` schema (`ce-beads-packet/1`) with `buildWorkerPacket()`; assembles unit, verification commands, requirement defs, and KTD excerpts into a single self-contained worker payload
-- `runtimes/runtime.ts`: `AgentRuntime` interface; pluggable worker runtime contract with two-phase `startWorkerPhase1`/`Phase2`, file-based completion wait, non-blocking crash-recovery `inspect`, and preview-gated `cleanup` (separate pane/worktree/branch actions)
-- `worker-report.ts`: `WorkerReport` schema (`ce-beads-worker-report/1`), strict structural validation, fallback pane-output JSON extraction
-- `run-state.ts`: `RunState`/`RunUnitRecord` with 6-state unit lifecycle (`pending->claimed->worker_finished->captured->merged->verified->closed`, with `blocked`), crash recovery via `last_successful_state` + `prompt_lifecycle`, atomic file persistence, `findActiveRunForPlan` (mid-initialization detection)
-- `git.ts`: minimal git helper functions (worktree add/remove, branch delete, merge with conflict detection, diff-stat, porcelain status, atomic add+commit) using `node:child_process`
+- Test fixtures: `17-work-failing-verification.md` (failing verification command), `18-work-u2-depends-on-u1-impl.md` (P0-1 worker-base-sha freshness), and `worker-reports/` (valid-complete, valid-blocked, invalid-missing-fields, invalid-bad-status, invalid-not-json).
+- `packet.ts`: packet action handler for standalone worker packet building
+- `runtimes/mock.ts`: MockRuntime for deterministic CI testing with real git worktrees
+- `worker-prompt.ts`: WORKER_AGENT_BODY system prompt and renderWorkerPrompt function
+- Test fixtures for failing verification and worker report validation
 ## 0.1.0 — 2026-07-21
 ### Added
 
