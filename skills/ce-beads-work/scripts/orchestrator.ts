@@ -621,7 +621,26 @@ export class RunEngine {
 
     // Fork from integration worktree HEAD (P0-1) unless resuming into an
     // already-forked workspace (crash between claim and worker finish).
+    // For retries (attempt > 1), the old workspace may contain partial files
+    // from the failed attempt — remove it and fork fresh from the integration
+    // HEAD so the next attempt starts clean (ce-beads-thread-Sv4Ns).
     let ws: Workspace;
+    const isRetry = record.attempt > 1;
+    if (isRetry && record.worktree_path && record.worker_branch) {
+      // Remove the old worktree and branch so we get a clean fork.
+      try {
+        await worktreeRemove(this.repoRoot, record.worktree_path, true);
+      } catch {
+        // best-effort — may already be gone
+      }
+      try {
+        await branchDelete(this.repoRoot, record.worker_branch, true);
+      } catch {
+        // best-effort
+      }
+      record.worktree_path = null;
+      record.worker_branch = null;
+    }
     if (record.worktree_path && record.worker_branch && existsSync(record.worktree_path)) {
       ws = {
         unitId,
@@ -782,6 +801,24 @@ export class RunEngine {
     // 5b. If worker_finished → capture.
     if (record.state === "worker_finished") {
       // 5b. CAPTURE: validate changed_files + commit.
+      // Re-read the result file on retry so a human-corrected report is
+      // picked up instead of the stale record.result from the failed
+      // attempt (ce-beads-thread-Sv4Nu).
+      if (record.worktree_path) {
+        const resultFile = join(record.worktree_path, WORKER_RESULT_FILE);
+        if (existsSync(resultFile)) {
+          try {
+            const raw = await readFile(resultFile, "utf8");
+            const parsed = JSON.parse(raw);
+            const validation = validateWorkerReport(parsed);
+            if (validation.ok) {
+              record.result = validation.report;
+            }
+          } catch {
+            // If re-read fails, fall through to record.result.
+          }
+        }
+      }
       const report = record.result!;
       const validatedSet = this.validateChangedFiles(report.changed_files, record.worktree_path!, plan.path);
       if (!validatedSet) {

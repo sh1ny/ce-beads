@@ -8,8 +8,9 @@
 //   ce-beads run reap <run-id> [--force] [--apply <token>]
 //   ce-beads run abandon <run-id> [--apply <token>]
 
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import type { CliArgs, ActionHandler } from "../../ce-beads/scripts/cli.ts";
+import { LockHolder } from "../../ce-beads/scripts/cli.ts";
 import {
   envelope,
   type ProtocolEnvelope,
@@ -91,7 +92,7 @@ async function runAction(args: CliArgs): Promise<ProtocolEnvelope> {
         ]);
       }
       const once = args.once === true;
-      return engine.start(planPath, { once });
+      return withPlanLock(planPath, repoRoot, () => engine.start(planPath, { once }));
     }
     case "status": {
       const runId = positional[2] as string | undefined;
@@ -110,7 +111,7 @@ async function runAction(args: CliArgs): Promise<ProtocolEnvelope> {
       }
       const once = args.once === true;
       const retry = args.retry === true;
-      return engine.resume(runId, { once, retry });
+      return withRunLock(runId, repoRoot, () => engine.resume(runId, { once, retry }));
     }
     case "reap": {
       const runId = positional[2];
@@ -125,7 +126,9 @@ async function runAction(args: CliArgs): Promise<ProtocolEnvelope> {
       }
       const force = args.force === true;
       const applyToken = args.applyToken;
-      return engine.reap(runId, { force, ...(applyToken !== undefined ? { applyToken } : {}) });
+      return withRunLock(runId, repoRoot, () =>
+        engine.reap(runId, { force, ...(applyToken !== undefined ? { applyToken } : {}) }),
+      );
     }
     case "abandon": {
       const runId = positional[2];
@@ -139,7 +142,9 @@ async function runAction(args: CliArgs): Promise<ProtocolEnvelope> {
         ]);
       }
       const applyToken = args.applyToken;
-      return engine.abandon(runId, ...(applyToken !== undefined ? [{ applyToken }] : [{}]));
+      return withRunLock(runId, repoRoot, () =>
+        engine.abandon(runId, ...(applyToken !== undefined ? [{ applyToken }] : [{}])),
+      );
     }
     default: {
       void beadsDir;
@@ -153,4 +158,54 @@ async function runAction(args: CliArgs): Promise<ProtocolEnvelope> {
       return envelope("run", false, "refused", null, diags);
     }
   }
+}
+
+/**
+ * Acquire the plan lock, run `fn`, and release. Serializes concurrent CLI
+ * processes that mutate the same plan (start, resume, reap, abandon).
+ * Returns LOCK_BUSY if another process holds the lock.
+ */
+async function withPlanLock(
+  planPath: string,
+  repoRoot: string,
+  fn: () => Promise<ProtocolEnvelope>,
+): Promise<ProtocolEnvelope> {
+  const lock = new LockHolder(resolve(planPath), repoRoot);
+  const acquired = await lock.tryAcquire();
+  if (!acquired) {
+    return envelope("run", false, "refused", null, [
+      { code: "LOCK_BUSY", severity: "blocking", message: `Another process is holding the lock for ${planPath}.` },
+    ]);
+  }
+  try {
+    return await fn();
+  } finally {
+    lock.release();
+  }
+}
+
+/**
+ * Resolve the plan path from a run ID, then acquire the plan lock.
+ * Used by resume/reap/abandon which receive a run ID, not a plan path.
+ */
+async function withRunLock(
+  runId: string,
+  repoRoot: string,
+  fn: () => Promise<ProtocolEnvelope>,
+): Promise<ProtocolEnvelope> {
+  // Resolve the plan path from the run-state file so we acquire the right lock.
+  // If the run-state can't be loaded, proceed without the lock — the engine
+  // will return the appropriate RUN_NOT_FOUND / RUN_STATE_CORRUPT error.
+  let planPath: string | null = null;
+  try {
+    const { loadRunState } = await import("./run-state.ts");
+    const state = loadRunState(runId, repoRoot);
+    planPath = state.plan_path;
+  } catch {
+    // Run not found or corrupt — let the engine handle the error.
+  }
+  if (!planPath) {
+    return fn();
+  }
+  return withPlanLock(planPath, repoRoot, fn);
 }
