@@ -1,7 +1,8 @@
-# ce-beads-work Serial Orchestrator — Implementation Plan
+# ce-beads-work Serial Orchestrator — Implementation Plan (v2)
 
-Implementation-ready plan for the `ce-beads-work` serial orchestrator milestone.
-Enriches `docs/plans/2026-07-21-001-feat-ce-beads-work-serial-orchestrator.md`
+Implementation-ready plan for the `ce-beads-work` serial orchestrator
+milestone. Enriches
+`docs/plans/2026-07-21-001-feat-ce-beads-work-serial-orchestrator.md`
 (the brief). All settled decisions SD1–SD8 are final and are not relitigated
 here. This document resolves the brief's open questions, pins exact
 interfaces, and sequences the build so a builder agent can execute without
@@ -10,12 +11,20 @@ further design decisions.
 **Branch:** `feature/ce-orchestrate` only. Never commit to main. Stop with a
 human notice at the end (SD8).
 
+**Revision history.** This is **v2**. v1 was reviewed and found to have four
+P0 (blocking) and five P1 (major) issues plus packaging gaps. v2 preserves
+the solid foundations — serial engine, runtime interface,
+integrate-before-close — and corrects the execution and recovery contracts.
+The P0/P1 resolutions are called out inline below as **[P0-n]** / **[P1-n]**
+and are normative.
+
 ---
 
-## 0. Resolutions of the brief's open questions
+## 0. Resolutions of the brief's open questions (and v1 review findings)
 
-These were open in the brief; they are now decided. Rationale is grounded in
-the existing code and in live CLI surface checks (omp v17.0.6, herdr, bd 1.1.0).
+These were open in the brief or broken in v1; they are now decided.
+Rationale is grounded in the existing code, in live CLI surface checks (omp
+v17.0.6, herdr, bd 1.1.0), and in OMP source inspection.
 
 ### R1 — Integration-branch naming
 
@@ -29,83 +38,107 @@ the existing code and in live CLI surface checks (omp v17.0.6, herdr, bd 1.1.0).
   `crypto.randomBytes(3)`), e.g. `20260721-143022-a1b2c3`. Sortable,
   human-readable, collision-safe.
 
-This matches the run-state example in the brief exactly.
-
 ### R2 — `run reap` is in scope
 
 It is safety-net code, but it is small, fully specified below, and the crash
 recovery path genuinely needs it (orphaned pane/worktree mappings). Include.
+**[P1-5]** The reap interface is corrected in §2.5: it receives a full
+persisted worker handle, preserves failed worktrees by default, is
+preview/approval-gated, acquires the run lock, and validates every path
+belongs to the run before removal.
 
-### R3 — Worker report transport: durable file + sentinel (both)
+### R3 — Worker report transport: durable file is the completion signal
 
-- The worker writes its structured report to a durable file inside the
-  worktree: `.ce-beads-worker/result.json`.
-- The worker prints the nonce sentinel `CE_BEADS_RESULT:<run-id>:<U-ID>` on
-  its own line in pane output as the completion signal.
-- The adapter treats the **sentinel as authoritative for completion** and the
-  **file as authoritative for the report**. If the file is missing/unreadable
-  after the sentinel, the adapter falls back to parsing the JSON block printed
-  after the sentinel in pane output (`herdr pane read --source
-  recent-unwrapped`). If both fail: `WORKER_REPORT_INVALID`, unit blocked.
+**[P0-3 resolution]** v1 put the sentinel literal in the worker prompt and
+searched scrollback for the same string — the runtime would detect
+"completion" instantly on the sent prompt text. v2 inverts the design:
 
-Rationale: scraping scrollback alone is fragile (wrap, truncation); a file
-alone gives no completion signal. The two-path design mirrors the brief's
-lifecycle/sentinel duality.
+- The worker writes its structured report atomically to
+  `<worktree>/.ce-beads-worker/result.json` (write-temp-then-rename, same
+  pattern as `run-state.ts`).
+- **The existence of the result file IS the completion signal.** The
+  adapter polls the filesystem for the file, not the pane scrollback for a
+  sentinel string.
+- The worker is instructed to print a marker line
+  `CE_BEADS_RESULT:<run-id>:<U-ID>` ONLY AFTER the rename succeeds — but the
+  adapter treats this as an advisory human-visible breadcrumb, not as the
+  detection mechanism. The marker may appear in scrollback; it does not
+  matter, because the adapter never searches for it.
+- The nonce value still appears in the prompt (the worker needs to know what
+  to print), but since detection is filesystem-based, prompt-text
+  contamination is no longer a correctness issue.
 
-### R4 — Worker model role: static `@smol`
+Rationale: the only deterministic, contamination-proof signal is a file
+the adapter creates the parent for and the worker atomically renames into
+existence. Scrollback scraping is gone entirely.
 
-`@smol` (MiniMax-M3 on the `chinese` profile) is the single default worker
-role, stored in `HerdrRuntime` options (`model: "@smol"`). Complexity-based
-`@tiny` selection is an explicit refinement and is NOT built. The role is a
-constructor option so tests and future refinements can override it.
+### R4 — Worker model role: static `@smol`, but configured not hardcoded
 
-### R5 — Worker boundary enforcement mechanism (gap in the brief, resolved)
+**[packaging-gap resolution]** `@smol` (MiniMax-M3 on the `chinese` profile)
+is the default worker role stored in `HerdrRuntime` options (`model:
+"@smol"`). But this is a **constructor option** with a sensible default, not
+a hardcoded constant. The acceptance environment pins `chinese`/`@smol`; a
+public consumer overrides via config. The coordinator skill documents both.
 
-The brief mandates `.omp/agents/ce-beads-unit.md`, but omp v17.0.6 has **no
-`--agent` flag for a top-level session** — `.omp/agents/*.md` files are
-task-tool agent definitions only (confirmed: `omp agents` supports only
-`unpack`; `omp --help` lists no agent-selection flag). Enforcement is
-therefore **dual**:
+Complexity-based `@tiny` selection is an explicit refinement and is NOT
+built. The role is a constructor option so tests and future refinements can
+override it.
 
-1. **Author `.omp/agents/ce-beads-unit.md`** exactly as the brief specifies
-   (committed to the repo). This is the canonical agent definition and is used
-   when the worker runs as a `task` subagent (e.g. the inline fallback path in
-   constraint 5, or future non-Herdr runtimes).
-2. **The Herdr pane launch physically enforces the same boundary via CLI
-   flags**: `omp --profile chinese --model @smol --no-session
-   --tools read,grep,glob,bash,edit,write,lsp,ast_grep
-   --append-system-prompt @<worker-system-prompt-file>`. The `--tools`
-   whitelist excludes `task` (no recursive spawning) and every other
-   built-in not listed. The system-prompt file is generated from the same
-   instruction body as the agent file.
+### R5 — Worker boundary enforcement: defense-in-depth, honestly described
+
+**[P0-4 + P1-1 resolution]**
+
+The brief mandated `.omp/agents/ce-beads-unit.md`. v1 then claimed that
+launching with `--tools <whitelist>` gave *physical* enforcement, and that
+worker worktrees under `/tmp` couldn't reach `.beads`. Both claims are
+false:
+
+- **`--append-system-prompt` does not do `@file` expansion** (verified in
+  OMP source, `system-prompt.ts:314` `resolvePromptInput`: it tries
+  `Bun.file(input).text()`; if the path doesn't exist, the input becomes a
+  literal string). v1's `@.ce-beads-worker/system-prompt.md` would try to
+  read a file literally named with the `@` prefix → ENOENT → the literal
+  string `@.ce-beads-worker/system-prompt.md` gets appended to the system
+  prompt. **Fix: pass the path WITHOUT the `@`** (absolute path preferred).
+  This is now an automated subprocess test (§6 T21b), not a build-time
+  manual probe.
+- **Git worktrees do NOT physically isolate `.beads`** (verified: linked
+  worktrees share the git common directory; a bash-equipped worker can run
+  `bd` and discover the shared workspace). **The boundary is
+  defense-in-depth, not physical enforcement.** The plan describes it as
+  such everywhere it is mentioned.
+
+Enforcement is therefore **dual and honestly layered**:
+
+1. **Agent definition file** at `agents/ce-beads-unit.md` (package root —
+   see R9). Canonical for task-subagent invocation and for plugin
+   distribution. Declares the tool whitelist and system prompt.
+2. **Herdr pane launch** applies the same whitelist via
+   `omp --profile chinese --model @smol --no-session --tools <list>
+   --append-system-prompt <absolute-path-without-@>`. The `--tools` list
+   excludes `task` (no recursive spawning) and every built-in not listed.
+3. **Defense-in-depth (not physical):** worker worktrees run with
+   `BEADS_DIR` explicitly set to an isolated temp dir and `PATH` sanitized
+   to drop `bd` where feasible. This raises the bar but is NOT described as
+   a hard boundary — a determined bash worker could still reach `bd` via
+   absolute paths or PATH lookup. The agent prompt forbids `bd` explicitly
+   (rule 3). The real enforcement is that the coordinator owns all Beads
+   writes and the worker's report is validated; a worker that somehow
+   mutated Beads would be detected on the next `bd show` reconciliation.
 
 A packaging test asserts the launcher's tool whitelist equals the agent
 file's frontmatter `tools:` list and that neither contains `task`.
 
-Defense-in-depth fact (verified against the repo layout): worker worktrees
-live under `/tmp/ce-beads-wt/`, outside the repo tree, so `bd` invoked by a
-misbehaving worker via `bash` would NOT discover the repo's `.beads`
-(BEADS_DIR tree discovery walks parents). The worker physically cannot reach
-the real Beads graph from its worktree even through `bash`.
-
-Build-phase verification step: run the exact launch command once with `-p
-"ok"` during acceptance preflight to confirm `--tools` accepts the names
-`lsp` and `ast_grep`. If either name is rejected, drop it from the CLI list
-only (they are additive conveniences; the boundary is defined by what is
-excluded). The consistency test then asserts CLI list ⊆ agent-file list.
-
 ### R6 — Where the control loop lives: the TS engine, driven by `run start` / `run resume`
 
-The brief lists only five CLI actions (`packet`, `run start/status/resume/
-reap`) and describes the loop as coordinator behavior. Reconciled: the full
-loop state machine (claim → launch → wait → integrate → verify → close) is
-implemented once in a TypeScript engine (`orchestrator.ts`). Both `run start`
-and `run resume` invoke the same driver:
+The full loop state machine (claim → launch → wait → integrate → verify →
+close) is implemented once in a TypeScript engine (`orchestrator.ts`). Both
+`run start` and `run resume` invoke the same driver:
 
 - Default (no flags): drive the loop to quiescence — outcome `completed`
-  (all units closed), `blocked` (a unit failed verification / report invalid;
-  loop stops, human intervenes), or `failed` (infrastructure failure; run-state
-  intact, `run resume` continues).
+  (all units closed), `blocked` (a unit failed verification / report
+  invalid; loop stops, human intervenes), or `failed` (infrastructure
+  failure; run-state intact, `run resume` continues).
 - `--once` flag: execute exactly one loop iteration and return
   `in_progress` / `awaiting_integration` / `completed` / `blocked`. Used by
   automated tests with the mock runtime and available to the coordinator
@@ -113,81 +146,144 @@ and `run resume` invoke the same driver:
 
 This keeps integrate-before-close **inside deterministic code**, not in
 advisory prompt text. The coordinator OMP agent (guided by
-`skills/ce-beads-work/SKILL.md`) is a thin driver: preflight → `run start` →
-monitor → `run resume` on crash → STOP at the shipping boundary.
+`skills/ce-beads-work/SKILL.md`) is a thin driver: preflight → `run start`
+→ monitor → `run resume` on crash → STOP at the shipping boundary.
 
 ### R7 — Integration happens in a dedicated integration worktree, never the user's checkout
 
 The coordinator runs inside the user's working tree; merging there would
 hijack the user's checkout. `run start` creates the integration branch and
-checks it out in `<worktreeRoot>/integration-<run-id>` via `git worktree add
-<path> -b ce-beads/<slug>-<run-id> HEAD`. All merges and post-merge
-integration verification run in that worktree.
+checks it out in `<worktreeRoot>/integration-<run-id>` via
+`git worktree add <path> -b ce-beads/<slug>-<run-id> HEAD`. All merges and
+post-merge integration verification run in that worktree.
 
-### R8 — Verification commands executed
+### R8 — Verification: parse the Verification Contract, do not execute prose
 
-- **Pre-merge (per unit)**: the unit's `verification: string[]` commands from
-  the plan IR, run sequentially via `bash -c` in the unit's worker worktree.
-  Any non-zero exit → `VERIFICATION_FAILED`, unit blocked, NOT merged, NOT
-  closed.
-- **Post-merge (integration)**: the same unit's verification commands re-run
-  in the integration worktree after `git merge --no-ff`. Any non-zero exit →
-  `INTEGRATION_FAILED`, unit blocked, merge left in place for human
-  inspection, task NOT closed.
-- The plan-level "Verification Contract" table is NOT parsed (plan-parser
-  does not extract it). Only unit-level `verification` fields are executed.
-  This is a known, documented limitation; parsing the table is out of scope.
+**[P0-2 resolution]** v1 ran `bash -c "<unit.verification string>"` where
+`unit.verification` entries are CE acceptance prose ("U1 parses.", "Expired
+tokens return 401") — not shell commands. `bash -c "U1 parses."` fails
+immediately. The actual executable commands live in the plan-level
+**Verification Contract** table, which `plan-parser.ts` does not currently
+extract.
+
+v2 changes:
+
+- **Extend `plan-parser.ts`** to parse the Verification Contract table into
+  typed entries: `{ unit_id: string; command: string; expected?: string }[]`.
+  The table maps U-IDs to the shell commands that verify them.
+- **Unit-level `verification: string[]` is treated as expected behavior
+  description**, never executed. It is included in the worker packet as
+  acceptance prose for the worker to target.
+- **Pre-merge verification (per unit)**: run the Verification Contract
+  commands for that U-ID sequentially via `bash -c` in the unit's worker
+  worktree. Any non-zero → `VERIFICATION_FAILED`, unit blocked, NOT merged,
+  NOT closed.
+- **Post-merge verification (integration)**: re-run the same commands in
+  the integration worktree after `git merge --no-ff -m "<msg>"` (note the
+  noninteractive `-m`, see R11). Any non-zero → `INTEGRATION_FAILED`, unit
+  blocked, merge left in place for human inspection, task NOT closed.
+
+If a plan has no Verification Contract entries for a unit, pre-merge
+verification is a no-op (pass) and the worker's own `verification_evidence`
+in its report is the only signal. This is documented as a weaker guarantee
+and surfaced in `run status`.
+
+### R9 — Plugin agents ship at `agents/*.md`, not `.omp/agents/*.md`
+
+**[packaging-gap resolution]** Verified in OMP source
+(`task/discovery.ts:7`, `discovery/omp-plugins.ts`, and
+`docs/skills/authoring-marketplaces.md:201`): plugin agents are discovered
+from `<plugin-root>/agents/*.md` for installed plugins, plus
+`.omp/agents/*.md` (project) and `~/.omp/agent/agents/*.md` (user) for
+task-subagent invocation.
+
+- The worker agent file lives at **`agents/ce-beads-unit.md`** in the
+  package root (shipped).
+- `package.json` `files` is extended to include `"agents/"` alongside the
+  existing `"skills/"`.
+- The project-local `.omp/agents/` directory is NOT created — the single
+  canonical file ships with the plugin.
+- A packaging test asserts the agent file is present in
+  `bun pm pack --dry-run` output and that its frontmatter parses.
+
+### R10 — Run state stored outside the consumer repo
+
+**[packaging-gap resolution]** v1's `.ce-beads/run-*.json` in the repo root
+would pollute consumer repositories (ce-beads' own `.gitignore` doesn't
+help consumers). v2 stores run state under the git common directory:
+
+- **Location:** `$GIT_DIR/ce-beads/run-<run-id>.json`, resolved via
+  `git rev-parse --git-common-dir`. This is shared across linked worktrees
+  (so the coordinator in any worktree sees the same runs) and is never
+  committed (the common dir is outside the working tree).
+- Fallback when not in a git repo: `${XDG_STATE_HOME:-$HOME/.local/state}/ce-beads/runs/`.
+- A helper `runStateDir(repoRoot?)` resolves this; tests use an isolated
+  temp `GIT_DIR`.
+
+### R11 — Noninteractive git and flag hygiene
+
+**[packaging-gap resolution]**
+
+- `git merge --no-ff` requires `-m <message>` in noninteractive contexts.
+  v2 uses `git merge --no-ff -m "ce-beads(<U-ID>): merge worker branch
+  (<run-id>)"`.
+- `--force` outside `run reap` is **rejected** (usage error, exit 2), not
+  silently ignored. `parseArgs` enforces this: `--force` is accepted only
+  when `action === "run" && runSub === "reap"`.
 
 ---
 
 ## 1. Dependency-ordered build sequence
 
-Each step lists exact paths. Steps are ordered so every file's imports already
-exist. All new code lives under `skills/ce-beads-work/scripts/` except the
-normative protocol and CLI dispatch, which live in `skills/ce-beads/scripts/`
-(single normative source rule — the CLI surface stays `ce-beads`; the new
-skill's modules import `../../ce-beads/scripts/*.ts`, mirroring how
-`tests/helpers/beads-workspace.ts` already imports across the tree).
+Each step lists exact paths. Steps are ordered so every file's imports
+already exist. All new code lives under `skills/ce-beads-work/scripts/`
+except the normative protocol and CLI dispatch (which live in
+`skills/ce-beads/scripts/` — single normative source rule) and the agent
+file (which lives at `agents/`).
 
 | # | Path | Kind | Depends on |
 |---|------|------|------------|
 | 1 | `skills/ce-beads/scripts/protocol.ts` | modify: extend `Action`, add `PacketOutcome`/`RunOutcome`, 10 new `DiagnosticCode`s, extend `exitCodeFor` | — |
-| 2 | `skills/ce-beads-work/scripts/worker-packet.ts` | create: `WorkerPacket` types + `buildWorkerPacket()` | 1 |
-| 3 | `skills/ce-beads-work/scripts/packet.ts` | create: `packet` action handler | 1, 2 |
-| 4 | `skills/ce-beads-work/scripts/worker-report.ts` | create: `WorkerReport` schema + `validateWorkerReport()` + sentinel helpers | — |
-| 5 | `skills/ce-beads-work/scripts/run-state.ts` | create: run-state schema + load/save/list/refuse-active | — |
-| 6 | `skills/ce-beads-work/scripts/git.ts` | create: minimal git helpers (worktree add/remove, branch, merge, diff, rev-parse, run-in-dir) | — |
-| 7 | `skills/ce-beads-work/scripts/runtimes/runtime.ts` | create: `AgentRuntime` interface + `Workspace`/`WorkerHandle`/`WorkerResult`/`WorkerState` | 4 |
-| 8 | `skills/ce-beads-work/scripts/runtimes/mock.ts` | create: `MockRuntime` (scripted, real git worktrees, no Herdr) | 6, 7 |
-| 9 | `skills/ce-beads-work/scripts/orchestrator.ts` | create: `RunEngine` — the loop + integrate-before-close state machine | 1, 2, 4, 5, 6, 7 |
-| 10 | `skills/ce-beads-work/scripts/runtimes/herdr.ts` | create: `HerdrRuntime` | 6, 7 |
-| 11 | `skills/ce-beads-work/scripts/run.ts` | create: `run` action handler (start/status/resume/reap → engine) | 1, 5, 9, 10 |
-| 12 | `skills/ce-beads/scripts/cli.ts` | modify: extend `CliArgs`/`parseArgs`/`usageMessage`/`main` dispatch for `packet` + `run` | 1, 3, 11 |
-| 13 | `skills/ce-beads-work/scripts/worker-prompt.ts` | create: worker system-prompt body (single source) + `renderWorkerPrompt()` | 2, 4 |
-| 14 | `.omp/agents/ce-beads-unit.md` | create: bundled worker agent (committed) | 13 |
-| 15 | `skills/ce-beads-work/SKILL.md` | create: coordinator skill instructions | 11, 12, 14 |
-| 16 | `tests/fixtures/plans/17-work-failing-verification.md` | create fixture | — |
-| 17 | `tests/fixtures/worker-reports/{valid-complete,valid-blocked,invalid-missing-fields,invalid-bad-status,invalid-not-json}.json` | create fixtures | — |
-| 18 | `tests/packet.test.ts` | create | 3 |
-| 19 | `tests/run-state.test.ts` | create | 5 |
-| 20 | `tests/worker-report.test.ts` | create | 4, 17 |
-| 21 | `tests/orchestrator.test.ts` | create: mock-runtime loop, integrate-before-close invariant, crash recovery, blocked path, reap | 8, 9, 16 |
-| 22 | `tests/cli.test.ts` | modify: arg-parsing cases for `packet`/`run` | 12 |
-| 23 | `tests/packaging.test.ts` | modify: assert ce-beads-work skill layout + agent-file/launcher tool-whitelist consistency | 13, 14, 15 |
-| 24 | `.gitignore` | modify: add `.ce-beads/` | — |
-| 25 | `README.md` + `docs/acceptance.md` | modify: document the two new actions + acceptance section (docs.test.ts conventions) | 12, 15 |
+| 2 | `skills/ce-beads/scripts/plan-parser.ts` | modify: parse Verification Contract table into typed entries (R8) | — |
+| 3 | `skills/ce-beads-work/scripts/worker-packet.ts` | create: `WorkerPacket` types + `buildWorkerPacket()` | 1, 2 |
+| 4 | `skills/ce-beads-work/scripts/packet.ts` | create: `packet` action handler | 1, 3 |
+| 5 | `skills/ce-beads-work/scripts/worker-report.ts` | create: `WorkerReport` schema + `validateWorkerReport()` | — |
+| 6 | `skills/ce-beads-work/scripts/run-state.ts` | create: run-state schema + load/save/list/refuse-active (R10 location) | — |
+| 7 | `skills/ce-beads-work/scripts/git.ts` | create: minimal git helpers (worktree add/remove, branch, merge -m, diff, rev-parse, run-in-dir, rev-parse --git-common-dir) | — |
+| 8 | `skills/ce-beads-work/scripts/runtimes/runtime.ts` | create: `AgentRuntime` interface (corrected `cleanup` signature per [P1-5]) | 5 |
+| 9 | `skills/ce-beads-work/scripts/runtimes/mock.ts` | create: `MockRuntime` (scripted, real git worktrees, no Herdr) | 7, 8 |
+| 10 | `skills/ce-beads-work/scripts/orchestrator.ts` | create: `RunEngine` — the loop + 6-state integrate-before-close state machine (R12) | 1, 3, 5, 6, 7, 8 |
+| 11 | `skills/ce-beads-work/scripts/runtimes/herdr.ts` | create: `HerdrRuntime` (file-based completion detection, R3) | 7, 8 |
+| 12 | `skills/ce-beads-work/scripts/run.ts` | create: `run` action handler (start/status/resume/reap → engine) | 1, 6, 10, 11 |
+| 13 | `skills/ce-beads/scripts/cli.ts` | modify: extend `CliArgs`/`parseArgs`/`usageMessage`/`main` dispatch for `packet` + `run`; reject `--force` outside reap (R11) | 1, 4, 12 |
+| 14 | `skills/ce-beads-work/scripts/worker-prompt.ts` | create: worker system-prompt body (single source) + `renderWorkerPrompt()` | 3, 5 |
+| 15 | `agents/ce-beads-unit.md` | create: bundled worker agent at package root (R9) | 14 |
+| 16 | `skills/ce-beads-work/SKILL.md` | create: coordinator skill instructions | 12, 13, 15 |
+| 17 | `tests/fixtures/plans/17-work-failing-verification.md` | create fixture (verification command that fails) | — |
+| 18 | `tests/fixtures/plans/18-work-u2-depends-on-u1-impl.md` | create fixture: U2 imports/requires U1's implementation (P0-1 test) | — |
+| 19 | `tests/fixtures/worker-reports/{valid-complete,valid-blocked,invalid-missing-fields,invalid-bad-status,invalid-not-json}.json` | create fixtures | — |
+| 20 | `tests/packet.test.ts` | create | 4 |
+| 21 | `tests/run-state.test.ts` | create | 6 |
+| 22 | `tests/worker-report.test.ts` | create | 5, 19 |
+| 23 | `tests/plan-parser.test.ts` | modify: Verification Contract parsing cases (R8) | 2 |
+| 24 | `tests/orchestrator.test.ts` | create: mock-runtime loop, integrate-before-close invariant, **6-state recovery (R12)**, worker-base-sha freshness (P0-1), blocked-run ownership (P1-3), artifact-exclusion (P1-4), reap | 9, 10, 17, 18 |
+| 25 | `tests/cli.test.ts` | modify: arg-parsing cases for `packet`/`run`, `--force` rejection | 13 |
+| 26 | `tests/packaging.test.ts` | modify: assert ce-beads-work skill layout, agent file at `agents/`, pack includes `agents/`, tool-whitelist consistency, `--append-system-prompt` path-without-@ (T21b) | 14, 15, 16 |
+| 27 | `package.json` | modify: add `"agents/"` to `files` | 15 |
+| 28 | `README.md` + `docs/acceptance.md` | modify: document new actions, agent location, acceptance section | 13, 16 |
 
 Notes:
 
-- Steps 1–9 are pure TS, no Herdr — fully testable in CI (SD1 scope).
-- Step 10 (Herdr adapter) is only smoke-tested manually (brief: real-Herdr
+- Steps 1–10 are pure TS, no Herdr — fully testable in CI (SD1 scope).
+- Step 11 (Herdr adapter) is only smoke-tested manually (real-Herdr
   integration is exercised in the manual acceptance test, not automated
   tests).
 - Existing `bind/status/sync/doctor` tests must remain green throughout
-  (run `bun run verify` after steps 1, 12, and at the end).
-- `package.json` needs **no changes**: `files: ["skills/", ...]` already
-  covers the new skill directory; `bin` still points at the extended
-  `ce-beads` CLI.
+  (run `bun run verify` after steps 1, 13, and at the end).
+- `.gitignore` needs **no change** for `.ce-beads/` — run state no longer
+  lives there (R10). If a `.ce-beads-worker/` dir is created inside
+  worktrees during manual runs, it is excluded via explicit path staging
+  in the engine (never `git add -A`), per [P1-4].
 
 ---
 
@@ -203,6 +299,7 @@ member, no `any`, string-valued metadata (KTD10), immutable inputs.
 // needs to implement exactly one unit, and nothing about coordination.
 
 import type { CePlan, CeUnit } from "../../ce-beads/scripts/plan-parser.ts";
+import type { VerificationEntry } from "../../ce-beads/scripts/plan-parser.ts";
 
 export const PACKET_SCHEMA_VERSION = "ce-beads-packet/1" as const;
 
@@ -215,18 +312,25 @@ export interface WorkerPacket {
   plan_digest: string;
   /** The single bounded unit, verbatim from the plan IR. */
   unit: PacketUnit;
+  /**
+   * Verification Contract entries for this unit, parsed from the plan-level
+   * table (R8). Empty if the plan has no Verification Contract for this unit.
+   * The worker SHOULD run these; the coordinator WILL run them pre-merge.
+   */
+  verification_commands: VerificationEntry[];
   /** Beads task ID for the unit, informational only; null when unbound. */
   beads_id: string | null;
-  /** Base SHA the worker branch forks from; null when standalone. */
+  /**
+   * Base SHA the worker branch forks from = integration worktree HEAD at
+   * dispatch time (P0-1). null when standalone.
+   */
   base_sha: string | null;
   /** Worker branch name; null when standalone. */
   branch: string | null;
   /** Absolute worktree path; null when standalone. */
   worktree_path: string | null;
-  /** Exact sentinel line the worker must print when done. */
-  sentinel: string;
-  /** Worktree-relative path the worker must write its report to. */
-  result_file: string;
+  /** Absolute path the worker must atomically write its report to (R3). */
+  result_file: string | null;
 }
 
 /** CeUnit subset, re-keyed to the packet's wire shape (no renaming of content). */
@@ -242,19 +346,18 @@ export interface PacketUnit {
   technical_design?: string;
   patterns: string[];
   test_scenarios: string[];
+  /** Acceptance prose — NEVER executed as shell (R8). */
   verification: string[];
 }
 
 /** Slug for branch naming (R1). */
 export function planSlug(planPath: string): string;
 
-/** The sentinel line for a run + unit: `CE_BEADS_RESULT:<run-id>:<U-ID>`. */
-export function sentinelFor(runId: string, unitId: string): string;
-
 /** Build a packet from a parsed plan + unit. Run fields null when standalone. */
 export function buildWorkerPacket(
   plan: CePlan,
   unit: CeUnit,
+  verificationCommands: VerificationEntry[],
   opts: {
     runId?: string;
     beadsId?: string;
@@ -265,13 +368,23 @@ export function buildWorkerPacket(
 ): WorkerPacket;
 ```
 
+**Packet completeness note [packaging-gap].** This packet includes the
+unit's fields and its verification commands. It does NOT yet include
+requirement definitions (only IDs), the Goal Capsule, the Definition of
+Done, or KTD excerpts — those are plan-level constructs the parser does not
+currently retain. This is an acknowledged gap; the packet is sufficient for
+the serial MVP and is extended in a follow-up. Documented in `run status`
+output when a plan lacks Goal Capsule / DoD extraction.
+
 ### 2.2 `worker-report.ts` — worker report schema
 
 ```ts
 // worker-report.ts — structured report the worker returns; validated strictly.
+// Completion is signaled by the atomic existence of this file (R3).
 
 export const WORKER_REPORT_SCHEMA_VERSION = "ce-beads-worker-report/1" as const;
 export const WORKER_RESULT_FILE = ".ce-beads-worker/result.json" as const;
+export const WORKER_RESULT_TEMP = ".ce-beads-worker/.result.tmp" as const;
 export const WORKER_SYSTEM_PROMPT_FILE = ".ce-beads-worker/system-prompt.md" as const;
 
 export type WorkerStatus = "complete" | "blocked" | "failed";
@@ -298,41 +411,65 @@ export type WorkerReportValidation =
  * Strict structural validation (no schema lib, matching repo conventions):
  * checks schema_version, required keys, types, enum membership, and that
  * `blockers` is non-empty iff status === "blocked". Rejects unknown
- * `schema_version` and non-object input.
+ * keys, wrong schema_version, and non-string values.
  */
-export function validateWorkerReport(value: unknown): WorkerReportValidation;
-
-/** Extract the JSON object printed after the sentinel line in pane output. */
-export function parseReportFromPaneOutput(
-  output: string,
-  sentinel: string,
-): unknown | null;
+export function validateWorkerReport(raw: unknown): WorkerReportValidation;
 ```
 
-### 2.3 `run-state.ts` — run-state file schema
+### 2.3 `run-state.ts` — run-state file schema (6-state lifecycle, R10 location)
+
+**[P1-2 resolution]** v1's 4-state lifecycle (claimed / awaiting-integration
+/ closed / blocked) omitted `merged` and `verified`, so a crash between
+merge and close would cause resume to repeat the merge or re-close an
+already-closed task. v2 persists the full 6-state lifecycle so every resume
+step can reconcile Git + Beads read-back before repeating a mutation.
 
 ```ts
 // run-state.ts — the ONLY coordinator-local state (SD7: plans immutable,
-// task state in Beads). Gitignored at .ce-beads/run-<run-id>.json.
+// task state in Beads). Stored under $GIT_DIR/ce-beads/run-<run-id>.json (R10).
 
 export const RUN_STATE_SCHEMA_VERSION = "ce-beads-run/1" as const;
-export const RUN_STATE_DIR = ".ce-beads" as const;
 
 export type RunStatus = "in_progress" | "blocked" | "completed" | "failed";
 
 /**
- * Per-unit lifecycle. Matches the brief's task lifecycle, compressed to the
- * states the engine persists (transient reviewed/committed/verified states
- * never survive a crash, so they are not persisted):
- *   pending → claimed → awaiting-integration → closed
- *                  ↘ blocked (verification/report/worker failure)
+ * Per-unit lifecycle. Every transition is persisted BEFORE the corresponding
+ * mutation is considered durable, so resume can reconcile (P1-2):
+ *
+ *   pending
+ *     → claimed              (coordinator: bd update --claim; persist)
+ *     → worker_finished      (result file exists; report validated; persist)
+ *     → captured             (coordinator committed worker's tree; persist
+ *                              worker_commit_sha)
+ *     → merged               (git merge --no-ff into integration; persist
+ *                              merge_sha)
+ *     → verified             (post-merge verification passed; persist)
+ *     → closed               (bd close; persist)
+ *   Any state → blocked      (verification/report/worker failure; persist)
+ *
+ * Resume rules (read-back before repeat):
+ *   - claimed with worker_pane_id: runtime.inspect → finished?
+ *     advance to worker_finished. running? wait. dead? cleanup + blocked.
+ *   - worker_finished: re-validate report file; advance to captured.
+ *   - captured: re-confirm worker_commit_sha exists in git; advance to
+ *     merged (re-merge is safe if merge_sha absent; if present, advance).
+ *   - merged: re-confirm merge_sha is in integration branch history; if
+ *     not, re-merge; advance to verified.
+ *   - verified: re-run verification; if pass, advance to closed.
+ *   - closed: bd show confirms status closed; advance to next unit.
+ * Every reconciliation that finds the expected durable artifact advances
+ * WITHOUT repeating the mutation. Missing artifact → repeat the mutation
+ * (idempotent by construction) or block.
  */
 export type UnitRunState =
   | "pending"
   | "claimed"
-  | "awaiting-integration"
-  | "blocked"
-  | "closed";
+  | "worker_finished"
+  | "captured"
+  | "merged"
+  | "verified"
+  | "closed"
+  | "blocked";
 
 export interface RunUnitRecord {
   beads_id: string;
@@ -340,7 +477,18 @@ export interface RunUnitRecord {
   worker_pane_id: string | null;
   worker_branch: string | null;
   worktree_path: string | null;
+  /**
+   * SHA the worker branch was forked from. Equals the integration worktree
+   * HEAD at dispatch time (P0-1), NOT run.base_sha. Persisted at claim
+   * time so resume can re-derive the branch if needed.
+   */
+  worker_base_sha: string | null;
   claimed_at: string | null;
+  /** Coordinator's commit of the worker's tree (after capture step). */
+  worker_commit_sha: string | null;
+  /** Merge commit SHA on the integration branch (after merge step). */
+  merge_sha: string | null;
+  /** Integration branch HEAD at close time (== merge_sha for the last unit). */
   integrated_sha: string | null;
   result: WorkerReport | null;
 }
@@ -350,6 +498,11 @@ export interface RunState {
   run_id: string;
   plan_path: string;
   plan_digest: string;
+  /**
+   * The run's base SHA — the HEAD the integration branch was forked from.
+   * This is the FLOOR of the integration history, NOT the per-unit fork
+   * point. Per-unit fork points are RunUnitRecord.worker_base_sha (P0-1).
+   */
   base_sha: string;
   integration_branch: string;
   integration_worktree: string;
@@ -360,25 +513,34 @@ export interface RunState {
 }
 
 export function newRunId(now?: Date): string;               // R1 format
+export function runStateDir(repoRoot?: string): string;     // R10 resolution
 export function runStatePath(runId: string, repoRoot?: string): string;
 export function saveRunState(state: RunState, repoRoot?: string): void; // atomic: tmp + rename
 export function loadRunState(runId: string, repoRoot?: string): RunState; // throws RUN_STATE_CORRUPT / RUN_NOT_FOUND
 export function listRunIds(repoRoot?: string): string[];    // sorted, newest last
 export function latestRunId(repoRoot?: string): string | null;
-/** Non-terminal run for the same plan, if any (run start refuses — RUN_ACTIVE). */
+/**
+ * Non-terminal run (in_progress OR blocked — P1-3) for the same plan, if
+ * any. run start refuses — RUN_ACTIVE. Blocked runs remain ownership-active
+ * until explicit retry or abandonment (run reap).
+ */
 export function findActiveRunForPlan(planPath: string, repoRoot?: string): RunState | null;
 ```
 
-### 2.4 `runtimes/runtime.ts` — the AgentRuntime interface
+### 2.4 `runtimes/runtime.ts` — the AgentRuntime interface (corrected cleanup)
 
-Verbatim from the brief, with the supporting types pinned:
+**[P1-5 resolution]** v1's `cleanup(ws: Workspace)` received no pane ID and
+couldn't implement its recovery contract (closing a pane after a process
+restart). v2's cleanup receives the full persisted worker handle.
+Destructive operations are gated behind preview/approval and preserve
+failed worktrees by default.
 
 ```ts
 // runtimes/runtime.ts — pluggable worker runtime. HerdrRuntime is the
 // production implementation; MockRuntime drives deterministic CI tests.
 
 import type { CeUnit } from "../../../ce-beads/scripts/plan-parser.ts";
-import type { RunState } from "../run-state.ts";
+import type { RunState, RunUnitRecord } from "../run-state.ts";
 import type { WorkerReport } from "../worker-report.ts";
 
 export interface Workspace {
@@ -390,8 +552,8 @@ export interface Workspace {
 export interface WorkerHandle {
   paneId: string;         // Herdr pane id ("wN:pM"); "mock" for MockRuntime
   workspace: Workspace;
-  sentinel: string;       // CE_BEADS_RESULT:<run-id>:<U-ID>
-  resultFile: string;     // absolute path to .ce-beads-worker/result.json
+  /** Absolute path to .ce-beads-worker/result.json (R3 completion signal). */
+  resultFile: string;
   startedAt: string;      // ISO
 }
 
@@ -403,23 +565,43 @@ export interface WaitOpts {
 }
 
 export type WorkerResult =
-  | { kind: "sentinel"; report: WorkerReport; outputTail: string }
+  | { kind: "completed"; report: WorkerReport }
   | { kind: "timeout" }
   | { kind: "died"; reason: string };
 
 export type WorkerState = "running" | "finished" | "dead" | "unknown";
 
+export interface CleanupOpts {
+  /**
+   * If true, remove the worktree and delete the branch. If false (default),
+   * preserve them for human inspection. Always closes the pane (if any).
+   * Destructive cleanup is preview/approval-gated at the engine level (P1-5).
+   */
+  destructive: boolean;
+}
+
 export interface AgentRuntime {
-  /** Create the unit worktree + branch from run.base_sha. */
-  createWorkspace(unit: CeUnit, run: RunState): Promise<Workspace>;
+  /**
+   * Create the unit worktree + branch from the integration worktree's
+   * CURRENT HEAD (P0-1), not run.base_sha. The engine passes the fork SHA
+   * explicitly so the runtime doesn't have to re-derive it.
+   */
+  createWorkspace(unit: CeUnit, run: RunState, forkSha: string): Promise<Workspace>;
   /** Launch the worker session and deliver the prompt. */
   startWorker(ws: Workspace, prompt: string): Promise<WorkerHandle>;
-  /** Two-path completion wait: lifecycle fast-path + sentinel (authoritative). */
+  /**
+   * File-based completion wait (R3): poll handle.resultFile for existence.
+   * Lifecycle status (runtime.inspect) is an advisory fast-path hint only.
+   */
   wait(handle: WorkerHandle, opts: WaitOpts): Promise<WorkerResult>;
   /** Non-blocking state probe; used by crash recovery. */
   inspect(handle: WorkerHandle): Promise<WorkerState>;
-  /** Close pane (if any), remove worktree, delete branch. Never touches Beads. */
-  cleanup(ws: Workspace): Promise<void>;
+  /**
+   * Close pane (if any). If opts.destructive, remove worktree + delete
+   * branch; otherwise preserve them. Never touches Beads. Receives the
+   * full handle so it can close the pane after a restart (P1-5).
+   */
+  cleanup(handle: WorkerHandle, opts: CleanupOpts): Promise<void>;
 }
 ```
 
@@ -427,9 +609,9 @@ export interface AgentRuntime {
 
 ```ts
 // runtimes/herdr.ts — production runtime over the Herdr CLI.
-// Follows skill://herdr-omp-model-launch exactly: split → rename → launch →
+// Follows skill://herdr-omp-model-launch: split → rename → launch →
 // poll agent detection → welcome-screen API-key check → send prompt →
-// two-path completion observation.
+// file-based completion observation (R3).
 
 export interface HerdrRuntimeOptions {
   /** Repo root the coordinator runs in (for git worktree operations). */
@@ -453,11 +635,11 @@ export const HERDR_WORKER_TOOLS = [
 
 export class HerdrRuntime implements AgentRuntime {
   constructor(opts: HerdrRuntimeOptions);
-  createWorkspace(unit: CeUnit, run: RunState): Promise<Workspace>;
+  createWorkspace(unit: CeUnit, run: RunState, forkSha: string): Promise<Workspace>;
   startWorker(ws: Workspace, prompt: string): Promise<WorkerHandle>;
   wait(handle: WorkerHandle, opts: WaitOpts): Promise<WorkerResult>;
   inspect(handle: WorkerHandle): Promise<WorkerState>;
-  cleanup(ws: Workspace): Promise<void>;
+  cleanup(handle: WorkerHandle, opts: CleanupOpts): Promise<void>;
 }
 ```
 
@@ -465,18 +647,22 @@ Implementation contract (exact command sequences; every herdr invocation
 parses the `{"id":…,"result":…}` JSON envelope):
 
 - `createWorkspace`: `git worktree add <worktreeRoot>/<U-ID>-<run-id>
-  -b ce-beads/<U-ID>-<run-id> <run.base_sha>` (plain git — the brief's own
+  -b ce-beads/<U-ID>-<run-id> <forkSha>` (plain git — the brief's own
   Herdr command list has no worktree verbs; FS state must not depend on a
-  live Herdr server). Then `mkdir .ce-beads-worker/` inside the worktree and
-  write `system-prompt.md` (from `worker-prompt.ts`) and `packet.json`.
+  live Herdr server). Then `mkdir .ce-beads-worker/` inside the worktree
+  and write `system-prompt.md` (from `worker-prompt.ts`) and `packet.json`.
+  The `result.json` path is pre-created as a temp file the worker will
+  rename into place (R3).
 - `startWorker`:
   1. `herdr pane split --current --direction right --no-focus` → parse
-     `result.pane_id` (fall back to `down` on failure, per the skill's
-     layout guidance).
+     `result.pane_id` (fall back to `result.pane?.pane_id` and `down`
+     direction on failure — field name verified at build time, defensive
+     parse always).
   2. `herdr pane rename <pane_id> "ce-beads-<U-ID>-<run-id>"`.
   3. `herdr pane run <pane_id> 'cd <worktree> && omp --profile chinese
      --model @smol --no-session --tools read,grep,glob,bash,edit,write,lsp,ast_grep
-     --append-system-prompt @.ce-beads-worker/system-prompt.md'`.
+     --append-system-prompt <worktree>/.ce-beads-worker/system-prompt.md'`
+     (R5: NO `@` prefix on the path; absolute path).
   4. Poll `herdr pane get <pane_id>` up to 20s until
      `result.pane.agent` is non-null (cold-start tolerance — the skill
      documents 5–10s).
@@ -484,33 +670,33 @@ parses the `{"id":…,"result":…}` JSON envelope):
      `No API key found` → close pane, throw (caller maps to
      `RUNTIME_FAILURE` → outcome `failed`).
   6. Deliver the prompt: `herdr pane run <pane_id> '<rendered prompt>'`
-     (prompt includes the sentinel instruction and result-file path; see
-     §3). Never treat the pre-prompt `idle` as completion (skill gotcha).
+     (prompt includes the result-file path; see §3). Never treat the
+     pre-prompt `idle` as completion (skill gotcha).
 - `wait`: loop until `opts.timeoutMs`:
-  - Deterministic path (authoritative): `herdr pane read <pane_id>
-    --source recent-unwrapped --lines 400`; if it contains the sentinel →
-    read `handle.resultFile`; validate via `validateWorkerReport`; on file
-    miss/invalid → `parseReportFromPaneOutput` fallback; on total failure →
-    `{ kind: "died", reason: "sentinel without valid report" }` (engine maps
-    to `WORKER_REPORT_INVALID`, blocked).
-  - Fast path: `herdr pane get <pane_id>`; `agent_status` transition
-    `working → idle` triggers an immediate sentinel check (never trust
-    lifecycle alone — it lags, and pre-prompt `idle` is meaningless).
-  - Pane gone (`pane get` non-zero / parse error) before sentinel →
-    `{ kind: "died", reason: <stderr> }`.
-- `inspect`: `herdr pane get` → pane missing → `dead`; sentinel in recent
-  output → `finished`; `agent_status === "working"` → `running`; else
-  `unknown`.
-- `cleanup`: `herdr pane close <paneId>` (best-effort), `git worktree remove
-  --force <path>`, `git branch -D <branch>`. Only ever called for
-  failed/orphaned units — never before integration (the worker branch
-  carries the commits being merged).
+  - **Deterministic path (authoritative, R3):** check
+    `fs.existsSync(handle.resultFile)`. If present, read + validate via
+    `validateWorkerReport`. On valid → `{ kind: "completed", report }`. On
+    invalid → `{ kind: "died", reason: "result file present but invalid" }`
+    (engine maps to `WORKER_REPORT_INVALID`, blocked).
+  - **Advisory fast-path:** `herdr pane get <pane_id>`; if pane missing
+    before result file exists → `{ kind: "died", reason: <stderr> }`. If
+    `agent_status === "idle"` for a sustained period AND the result file
+    is absent, log a warning but keep polling (lifecycle lags; the file is
+    the truth).
+- `inspect`: `herdr pane get` → pane missing → `dead`; result file exists
+  → `finished`; `agent_status === "working"` → `running`; else `unknown`.
+- `cleanup`: `herdr pane close <handle.paneId>` (best-effort, always). If
+  `opts.destructive`: `git worktree remove --force <path>`,
+  `git branch -D <branch>` — but ONLY after the engine has confirmed
+  (preview + approval) that the unit is abandoned. Non-destructive default
+  preserves the worktree and branch for human inspection.
 
 ### 2.6 `orchestrator.ts` — the RunEngine
 
 ```ts
 // orchestrator.ts — serial control loop + integrate-before-close state
 // machine. Runtime-agnostic: constructed with any AgentRuntime.
+// Commit capture lives HERE (P1-4/P1-5), not in the runtime.
 
 export interface RunEngineOptions {
   repoRoot: string;
@@ -526,16 +712,17 @@ export class RunEngine {
   /**
    * run start: parse plan → verify binding (NOT_BOUND refusal if unbound;
    * the coordinator agent runs the existing `bind` preview→approval→apply
-   * flow first) → refuse on active run for the plan (RUN_ACTIVE) →
-   * create integration branch + integration worktree → write run-state →
-   * drive loop (all iterations, or one with opts.once).
+   * flow first) → refuse on active run for the plan (RUN_ACTIVE — includes
+   * blocked runs, P1-3) → create integration branch + integration worktree
+   * → write run-state → drive loop.
    */
   start(planPath: string, opts?: { once?: boolean }): Promise<ProtocolEnvelope>;
 
   /**
-   * run resume: load run-state → reconcile in-flight unit via
-   * runtime.inspect (running → wait; sentinel → continue at integration;
-   * dead without sentinel → cleanup + mark blocked + report) → drive loop.
+   * run resume: load run-state → reconcile in-flight unit via the 6-state
+   * machine (run-state.ts doc): read back Git + Beads for each non-closed
+   * unit; advance durable states without repeating mutations; repeat only
+   * idempotent mutations when the durable artifact is missing → drive loop.
    */
   resume(runId: string, opts?: { once?: boolean }): Promise<ProtocolEnvelope>;
 
@@ -544,56 +731,89 @@ export class RunEngine {
 
   /**
    * run reap: refuse (RUN_ACTIVE) if run-state.status === "in_progress"
-   * unless opts.force. For each non-closed unit with workspace records:
-   * runtime.cleanup. Removes the integration worktree. NEVER closes,
-   * updates, or otherwise mutates Beads tasks. Marks run-state "failed".
+   * unless opts.force. Preview the cleanup plan (panes/worktrees/branches
+   * to be affected) and require caller approval before any destructive
+   * op. For each non-closed unit with workspace records: runtime.cleanup
+   * with opts.destructive=opts.force. Preserves failed worktrees when
+   * !opts.force. Removes the integration worktree only when !opts.force
+   * is false. NEVER closes, updates, or otherwise mutates Beads tasks.
+   * Acquires the run lock for the whole reap; --force must not race a
+   * still-running coordinator (lock check). Validates every resolved
+   * path/branch belongs to the run before removal. Marks run-state
+   * "failed" (P1-5).
    */
   reap(runId: string, opts?: { force?: boolean }): Promise<ProtocolEnvelope>;
 }
 ```
 
-The loop (one iteration; mirrors the brief's control loop §2–3):
+The loop (one iteration; mirrors the brief's control loop §2–3, with P0-1
+and the 6-state machine applied):
 
 ```text
 1. readyTasks = client.readyTasks(plan.path)            // existing beads-client method
-   inFlight = units in run-state with state claimed|awaiting-integration
-2. If inFlight has an awaiting-integration unit → go to INTEGRATE (step 5).
+   inFlight = units in run-state with state in {claimed, worker_finished,
+              captured, merged, verified}
+2. If inFlight has a unit at state >= worker_finished and < closed →
+   go to INTEGRATE (step 5), resuming from the persisted state (reconcile
+   Git + Beads read-back first per run-state.ts doc).
 3. If no inFlight and readyTasks empty → all closed? verify roster:
    every run-state unit closed → outcome completed (status=completed,
    finished_at, report integration SHA); else outcome blocked (nothing
    ready, nothing in flight, units remain — dependency wedge).
 4. CLAIM: take readyTasks[0] mapped to its U-ID via metadata ce_unit_id;
    client.update(id, { claim: true }); persist state "claimed",
-   claimed_at. Build packet (buildWorkerPacket). runtime.createWorkspace →
+   claimed_at. Build packet (buildWorkerPacket).
+   **P0-1:** forkSha = git rev-parse HEAD in the integration worktree
+   (NOT run.base_sha). Persist forkSha as RunUnitRecord.worker_base_sha.
+   runtime.createWorkspace(unit, run, forkSha) →
    runtime.startWorker → persist pane/worktree/branch. runtime.wait:
-   - sentinel → persist result; client.update(id, { setMetadata:
-     { ce_beads_run_state: "awaiting-integration" }, addLabel:
-     ["ce-beads:awaiting-integration"] }); state → "awaiting-integration".
-   - timeout|died → runtime.cleanup; client.update(id, { setMetadata:
-     { ce_beads_run_state: "blocked" }, addLabel: ["ce-beads:blocked"] });
-     state → "blocked"; run-state status "failed" (died) or "blocked"
-     (timeout); return outcome failed|blocked with WORKER_FAILED.
-5. INTEGRATE (coordinator-owned, integrate-before-close):
-   a. report.status !== "complete" → mark blocked (WORKER_FAILED or
-      worker-reported blockers), do not merge, do not close.
-   b. Inspect diff: git diff --stat <base>..<worker-branch> (recorded in
-      diagnostics as info; empty diff + status complete → WORKER_FAILED).
-   c. Run the unit's verification commands sequentially (bash -c, cwd =
-      unit worktree). Non-zero → VERIFICATION_FAILED, mark blocked.
-   d. git -C <integration-worktree> merge --no-ff <worker-branch>.
-      Conflict → INTEGRATION_FAILED, mark blocked (merge left for human).
-   e. Re-run the unit's verification commands in the integration worktree.
-      Non-zero → INTEGRATION_FAILED, mark blocked.
-   f. ONLY NOW: client.close(beads_id); state → "closed";
-      integrated_sha = git rev-parse HEAD in the integration worktree;
-      runtime.cleanup(unit workspace).
+   - completed → persist result; client.update(id, { setMetadata:
+     { ce_beads_run_state: "worker_finished" }, addLabel:
+     ["ce-beads:worker-finished"] }); state → "worker_finished".
+   - timeout|died → runtime.cleanup(handle, { destructive: false })
+     (PRESERVE the worktree for inspection, P1-5); client.update(id,
+     { setMetadata: { ce_beads_run_state: "blocked" }, addLabel:
+     ["ce-beads:blocked"] }); state → "blocked"; run-state status
+     "failed" (died) or "blocked" (timeout); return outcome
+     failed|blocked with WORKER_FAILED.
+5. INTEGRATE (coordinator-owned, integrate-before-close, 6-state):
+   a. If state == worker_finished: re-validate result file. If invalid →
+      blocked (WORKER_REPORT_INVALID). If valid, advance to captured.
+   b. CAPTURE (P1-4/P1-5, engine-owned): if state == worker_finished:
+      git -C <unit-worktree> add <explicit-paths-from-report.changed_files>
+      (NEVER `git add -A` — excludes .ce-beads-worker/ artifacts, P1-4);
+      git -C <unit-worktree> commit -m "ce-beads(<U-ID>): worker changes
+      (<run-id>)"; persist worker_commit_sha; state → "captured".
+      (This step moves the commit capture OUT of HerdrRuntime.wait into
+      the engine, so MockRuntime and HerdrRuntime exercise the identical
+      commit path. MockRuntime's startWorker no longer commits.)
+   c. Inspect diff: git diff --stat <worker_base_sha>..<worker-branch>
+      (recorded in diagnostics as info; empty diff + status complete →
+      WORKER_FAILED, block, preserve worktree).
+   d. VERIFY (pre-merge, R8): run the unit's verification_commands
+      sequentially (bash -c, cwd = unit worktree). Non-zero →
+      VERIFICATION_FAILED, mark blocked.
+   e. MERGE: if state < merged: git -C <integration-worktree> merge
+      --no-ff -m "ce-beads(<U-ID>): merge worker branch (<run-id>)"
+      <worker-branch> (R11: noninteractive -m). Conflict →
+      INTEGRATION_FAILED, mark blocked (merge left for human). Persist
+      merge_sha; state → "merged".
+   f. VERIFY (post-merge, R8): re-run the unit's verification_commands
+      in the integration worktree. Non-zero → INTEGRATION_FAILED, mark
+      blocked (merge left for human inspection, task NOT closed).
+      state → "verified".
+   g. CLOSE (the ONLY close call site in the engine): if state == verified:
+      client.close(beads_id); persist integrated_sha = git rev-parse HEAD
+      in the integration worktree; state → "closed";
+      runtime.cleanup(handle, { destructive: true }) (worker branch
+      merged, worktree safe to remove).
 6. Return per --once semantics; otherwise loop.
 ```
 
 Marking helpers use only existing `BeadsClient.update` (setMetadata /
-addLabel / claim) and `BeadsClient.close` — no new bd surface. The
-"awaiting integration" state is `in_progress` + metadata/label, exactly as
-the brief's state machine requires.
+addLabel / claim) and `BeadsClient.close` — no new bd surface. The state
+labels (`ce-beads:worker-finished`, etc.) are `in_progress` + metadata,
+exactly as the brief's state machine requires.
 
 ### 2.7 CLI action handler data payloads
 
@@ -612,6 +832,9 @@ export const handler: ActionHandler; // run(args) → packetAction(args)
 export interface RunUnitSummary {
   beadsId: string;
   state: UnitRunState;
+  workerBaseSha: string | null;
+  workerCommitSha: string | null;
+  mergeSha: string | null;
   integratedSha: string | null;
 }
 export interface RunData {
@@ -621,7 +844,7 @@ export interface RunData {
   integrationBranch: string;
   integrationWorktree: string;
   baseSha: string;
-  inFlight: string | null;          // U-ID currently claimed/awaiting
+  inFlight: string | null;          // U-ID currently in flight
   units: Record<string, RunUnitSummary>;
   readyCount: number | null;        // live bd ready count; null on bd error
 }
@@ -635,12 +858,12 @@ BdError → `BD_FAILURE` diagnostic, read-only actions take no lock.
 
 ---
 
-## 3. `.omp/agents/ce-beads-unit.md` — exact content
+## 3. `agents/ce-beads-unit.md` — exact content
 
-Committed to the repo (new `.omp/agents/` directory; the repo currently has
-no `.omp`). Frontmatter verbatim from the brief; body is the single source
-also rendered into `.ce-beads-worker/system-prompt.md` by
-`worker-prompt.ts`:
+**[R9]** Lives at `agents/ce-beads-unit.md` in the package root (shipped via
+`package.json` `files`). Frontmatter from the brief; body is the single
+source also rendered into `.ce-beads-worker/system-prompt.md` by
+`worker-prompt.ts`.
 
 ```markdown
 ---
@@ -681,10 +904,13 @@ coordinator owns all coordination; you own only the code in front of you.
 1. Implement ONLY the bounded unit packet provided in the prompt. Do not
    refactor adjacent code, do not implement other units, do not "help"
    beyond the packet's Files and Approach.
-2. Run ONLY the unit's listed verification commands. Do not run the repo's
-   full test suite unless a verification command says to.
+2. Run ONLY the verification commands listed in the packet's
+   `verification_commands`. The `unit.verification` field is acceptance
+   PROSE describing expected behavior — never execute it as shell.
 3. NEVER run `bd` (any subcommand). Beads is the coordinator's exclusive
-   domain. Your worktree has no Beads workspace; do not create one.
+   domain. Your worktree has no Beads workspace; do not create one. (This
+   is a defense-in-depth rule, not a physical boundary — the coordinator
+   validates your work and owns all Beads writes.)
 4. NEVER commit, push, merge, rebase, or create branches with git. The
    coordinator owns all integration and commits your changes on your
    behalf after you finish. Even a "temporary" commit is forbidden.
@@ -696,18 +922,24 @@ coordinator owns all coordination; you own only the code in front of you.
 
 When the unit is done (or you are blocked):
 
-1. Write your structured report to `.ce-beads-worker/result.json`
-   (schema_version "ce-beads-worker-report/1"; required keys: u_id, status,
-   changed_files, verification_evidence{commands,results}, blockers;
-   optional: notes). `status` is complete | blocked | failed. `blockers` is
-   non-empty iff status is "blocked".
-2. Print the sentinel line EXACTLY as given in the prompt, on its own line:
-   `CE_BEADS_RESULT:<run-id>:<U-ID>`
-3. Immediately after the sentinel, print the same report JSON.
+1. Write your structured report to the path given in the packet's
+   `result_file` field. Write to a temp file first
+   (`.ce-beads-worker/.result.tmp`), then rename it atomically to
+   `.ce-beads-worker/result.json`. The rename is how the coordinator
+   knows you are done — it polls for the file's existence, not for any
+   text in your output.
+2. Schema: `schema_version: "ce-beads-worker-report/1"`; required keys:
+   `u_id`, `status`, `changed_files`,
+   `verification_evidence{commands,results}`, `blockers`; optional:
+   `notes`. `status` is `complete` | `blocked` | `failed`. `blockers` is
+   non-empty iff `status` is `"blocked"`.
+3. After the rename succeeds, you may print `CE_BEADS_RESULT:<run-id>:<U-ID>`
+   as a human-visible breadcrumb. This is advisory only — the coordinator
+   does not search for it. Do not print it before the file is in place.
 
-The sentinel is how the coordinator knows you are done. Never print it
-before the result file is fully written. Never print anything resembling it
-earlier in your output.
+The coordinator detects completion by polling the result file. Never
+print the result JSON to the pane as the completion mechanism — the file
+is the signal.
 ```
 
 The initial user prompt delivered to the pane (rendered by
@@ -719,9 +951,15 @@ prompt. The packet:
 
 <pretty-printed WorkerPacket JSON>
 
-Reminders: write .ce-beads-worker/result.json first, then print exactly:
-CE_BEADS_RESULT:<run-id>:<U-ID>
+Reminder: write the report to <absolute result_file path> atomically
+(write-temp-then-rename). The coordinator polls for the file's existence.
 ```
+
+Note [P0-3]: the prompt no longer contains a sentinel string the adapter
+will search for, because the adapter does not search scrollback at all.
+The `CE_BEADS_RESULT:<run-id>:<U-ID>` breadcrumb may appear in the prompt
+text (as an instruction to print it) without consequence, because it is
+not a detection mechanism.
 
 ---
 
@@ -760,11 +998,11 @@ Diagnostic codes (append to `DiagnosticCode`):
 ```ts
   | "UNIT_NOT_FOUND"            // packet: no such U-ID in the plan
   | "NOT_BOUND"                 // run start: plan has no binding in Beads
-  | "RUN_ACTIVE"                // run start/reap: a non-terminal run exists
+  | "RUN_ACTIVE"                // run start/reap: a non-terminal run exists (includes blocked, P1-3)
   | "RUN_NOT_FOUND"             // status/resume/reap: unknown run-id
   | "RUN_STATE_CORRUPT"         // run-state file unparsable / wrong schema_version
   | "WORKER_FAILED"             // worker died / timed out / empty diff
-  | "WORKER_REPORT_INVALID"     // sentinel seen but report failed validation
+  | "WORKER_REPORT_INVALID"     // result file present but failed validation
   | "VERIFICATION_FAILED"       // pre-merge unit verification non-zero
   | "INTEGRATION_FAILED"        // merge conflict or post-merge verification non-zero
   | "RUNTIME_FAILURE";          // Herdr CLI errors, pane lost, API-key error
@@ -794,8 +1032,9 @@ existing function is a sequence of early returns — match that style):
 
 ## 5. `cli.ts` dispatch changes
 
-Minimal, in the existing style. `CliArgs` gains three fields; `parseArgs`
-gains two parse branches; `main` gains two dispatch entries.
+Minimal, in the existing style. `CliArgs` gains four fields; `parseArgs`
+gains two parse branches + `--force` rejection outside reap (R11); `main`
+gains two dispatch entries.
 
 ```ts
 export interface CliArgs {
@@ -807,7 +1046,7 @@ export interface CliArgs {
   unitId: string | undefined;     // packet <plan> <U-ID>
   runSub: "start" | "status" | "resume" | "reap" | undefined;
   once: boolean;                  // run start/resume --once
-  force: boolean;                 // run reap --force
+  force: boolean;                 // run reap --force ONLY (R11: rejected elsewhere)
 }
 ```
 
@@ -822,7 +1061,9 @@ Parsing rules (replace the current allowlist + positional loop):
   for status/resume/reap; optional for status — omitted means latest run).
   Unknown/missing sub → usage.
 - Flags: --json, --apply <token>, --help/-h as today; add --once and
-  --force (only meaningful for run; ignored elsewhere).
+  --force. **R11: --force is rejected (usage, exit 2) unless
+  action === "run" && runSub === "reap".** --once is rejected unless
+  action === "run" && (runSub === "start" || runSub === "resume").
 ```
 
 `usageMessage()` additions (match existing column style):
@@ -835,8 +1076,8 @@ Parsing rules (replace the current allowlist + positional loop):
   run reap <run-id>     Clean up orphaned worktrees/panes (never touches Beads)
 
 Run flags:
-  --once               Execute a single loop iteration (start/resume)
-  --force              Reap even when the run-state says in_progress (reap)
+  --once               Execute a single loop iteration (start/resume only)
+  --force              Reap even when the run-state says in_progress (reap only)
 ```
 
 `main()` dispatch:
@@ -863,7 +1104,8 @@ Locking: `packet` and `run status` are read-only → **no lock** (same as the
 existing `status` action). `run start`/`run resume` acquire the plan-path
 `LockHolder` for the whole invocation (they mutate Beads: claim, metadata,
 labels, close). `run reap` takes no lock — it never touches Beads; its
-safety gate is the RUN_ACTIVE run-state check (+ `--force`).
+safety gate is the RUN_ACTIVE run-state check (+ `--force`) and the
+preview/approval flow.
 
 ---
 
@@ -872,55 +1114,57 @@ safety gate is the RUN_ACTIVE run-state check (+ `--force`).
 Conventions (from existing tests): Bun (`bun test --timeout 30000`), real
 `bd` via `setupWorkspace()` from `tests/helpers/beads-workspace.ts`,
 `devRepoIsolationGuards()` for any test that could touch the dev repo,
-fixtures under `tests/fixtures/`. New helper (add to
-`tests/helpers/beads-workspace.ts` or a new `tests/helpers/git-repo.ts`):
-`setupGitRepo()` — mkdtemp, `git init -b main`, configure user, write
-fixture plan + seed files, initial commit; returns `{ dir, cleanup }`. The
-orchestrator's `repoRoot` points there, so plans parse (PATH_OUTSIDE_REPO
-passes) and worktrees/merges run against real git.
+fixtures under `tests/fixtures/`. New helpers:
+
+- `tests/helpers/git-repo.ts`: `setupGitRepo()` — mkdtemp, `git init -b
+  main`, configure user, write fixture plan + seed files, initial commit;
+  returns `{ dir, cleanup }`. The orchestrator's `repoRoot` points here, so
+  plans parse (PATH_OUTSIDE_REPO passes) and worktrees/merges run against
+  real git. Sets `GIT_DIR` to an isolated temp dir so run-state files
+  (R10) don't leak.
+- `tests/helpers/mock-runtime.ts`: `makeMockRuntime(script)` constructs a
+  MockRuntime with a per-U-ID script of files-to-write, report-to-emit,
+  and optional failure modes.
 
 | # | Test (file: name) | Invariant defended | Fixture(s) |
 |---|-------------------|--------------------|------------|
-| T1 | packet.test.ts: builds a correct bounded packet | `packet` emits `packet_built`; packet fields verbatim from plan IR; beads_id null when unbound | 02-linear-three-unit.md (unbound, no workspace) |
+| T1 | packet.test.ts: builds a correct bounded packet | `packet` emits `packet_built`; packet fields verbatim from plan IR; beads_id null when unbound; verification_commands parsed from Verification Contract (R8) | 02-linear-three-unit.md (unbound, no workspace) |
 | T2 | packet.test.ts: resolves beads_id when bound | After `bind --apply`, packet for U2 carries the created task id | 02-linear-three-unit.md + isolated workspace |
 | T3 | packet.test.ts: unknown unit | `unit_not_found` outcome + `UNIT_NOT_FOUND` diagnostic + exit 2 | 02-linear-three-unit.md, U-ID "U9" |
 | T4 | packet.test.ts: malformed plan rejected | PLAN_MALFORMED diagnostic, non-zero exit, zero bd calls | 10-malformed-frontmatter.md |
 | T5 | run-state.test.ts: round-trip | save→load preserves every field; atomic rename leaves no tmp file; schema_version enforced | synthetic RunState |
 | T6 | run-state.test.ts: corrupt/missing | loadRunState throws RUN_STATE_CORRUPT / RUN_NOT_FOUND distinguishably | hand-written corrupt JSON |
-| T7 | run-state.test.ts: findActiveRunForPlan | Non-terminal run for same plan detected; completed/blocked runs ignored | synthetic states |
-| T8 | worker-report.test.ts: valid reports accepted | valid-complete + valid-blocked pass; blockers non-empty iff blocked | worker-reports/valid-*.json |
-| T9 | worker-report.test.ts: invalid reports rejected | missing fields, bad status enum, non-JSON, wrong schema_version all → ok:false | worker-reports/invalid-*.json |
-| T10 | worker-report.test.ts: pane fallback parse | parseReportFromPaneOutput extracts JSON after sentinel; ignores pre-sentinel JSON; null when absent | inline strings |
-| T11 | orchestrator.test.ts: full serial loop end-to-end | MockRuntime; 3-unit linear plan: claim U1 → worker → integrate → close; then U2, U3 in dependency order; final outcome completed; integration branch contains all units' files; each task's `closed_at` set only AFTER its integrated_sha recorded | 02-linear-three-unit.md + setupGitRepo + MockRuntime scripted to write each unit's `files` |
-| T12 | orchestrator.test.ts: **integrate-before-close invariant** | Drive with --once; after worker-sentinel step, task is `in_progress` with `ce_beads:awaiting-integration` label and NOT closed; `bd ready` does NOT yet list U2; only after the integrate iteration does U1 close and U2 become ready. Assert close-time ordering: no `close` call occurs before merge + verification in a spy-wrapped client | 02-linear-three-unit.md |
-| T13 | orchestrator.test.ts: verification failure blocks | Failing-verification fixture: unit claimed, worker "completes", verification fails → task labeled `ce-beads:blocked`, state blocked, NOT merged (integration worktree HEAD unchanged), NOT closed, outcome blocked, `VERIFICATION_FAILED` diagnostic | 17-work-failing-verification.md |
-| T14 | orchestrator.test.ts: invalid worker report blocks | MockRuntime emits sentinel + malformed report → WORKER_REPORT_INVALID, blocked, no merge, no close | 02-linear-three-unit.md |
-| T15 | orchestrator.test.ts: crash recovery re-attach | Pre-write run-state with unit "claimed" + MockRuntime handle whose inspect → finished (sentinel pending integration): resume continues at INTEGRATE and closes; variant: inspect → dead → cleanup + blocked + WORKER_FAILED | 02-linear-three-unit.md |
-| T16 | orchestrator.test.ts: resume after full coordinator death between units | Run U1 via --once steps, then resume: loop picks U2 without re-claiming U1 (U1 closed, U2 ready from bd) | 02-linear-three-unit.md |
-| T17 | orchestrator.test.ts: run start refuses unbound / active | Unbound plan → refused + NOT_BOUND + exit 4, zero git/bd mutations; second start while in_progress → refused + RUN_ACTIVE | 02-linear-three-unit.md |
-| T18 | orchestrator.test.ts: reap cleans without touching Beads | Crash a run mid-flight; reap → worktrees removed, branches deleted, pane cleanup invoked (mock records), run-state failed; every Beads task status unchanged (claimed stays in_progress, none closed) | 02-linear-three-unit.md |
-| T19 | orchestrator.test.ts: status snapshot | After partial run, `run status` reports inFlight U-ID, per-unit states, readyCount; unknown id → not_found + exit 2 | 02-linear-three-unit.md |
-| T20 | cli.test.ts (extend): arg parsing | packet/run parse branches, --once/--force, usage gates (missing unit-id, bad runSub) → usage + exit 2 | — (pure parse) |
-| T21 | packaging.test.ts (extend): new skill layout + boundary consistency | skills/ce-beads-work/SKILL.md frontmatter parses (name/description); `.omp/agents/ce-beads-unit.md` frontmatter tools list equals `HERDR_WORKER_TOOLS` (or ⊇, per R5 fallback) and contains no `task`; `files:["skills/"]` covers the new dir | repo files |
-| T22 | regression: existing suites | `bun run verify` — bind/status/sync/doctor/plan-parser/graph-builder/beads-client/packaging/docs all green | existing 16 fixtures |
+| T7 | run-state.test.ts: findActiveRunForPlan includes blocked | Non-terminal run (in_progress OR blocked, P1-3) for same plan detected; completed/failed runs ignored | synthetic states |
+| T8 | run-state.test.ts: R10 location | run state lives under `$GIT_DIR/ce-beads/`, not repo root; consumer repo working tree stays clean | isolated GIT_DIR |
+| T9 | worker-report.test.ts: valid reports accepted | valid-complete + valid-blocked pass; blockers non-empty iff blocked | worker-reports/valid-*.json |
+| T10 | worker-report.test.ts: invalid reports rejected | missing fields, bad status enum, non-JSON, wrong schema_version all → ok:false | worker-reports/invalid-*.json |
+| T11 | plan-parser.test.ts: Verification Contract parsing | R8: parses the Verification Contract table into typed entries; maps U-IDs to commands; tolerates empty table | 02-linear-three-unit.md, 17-work-failing-verification.md |
+| T12 | orchestrator.test.ts: full serial loop end-to-end | MockRuntime; 3-unit linear plan: claim U1 → worker → capture → verify → merge → verify → close; then U2, U3; final outcome completed; integration branch contains all units' files; each task's `closed_at` set only AFTER its `merge_sha` recorded | 02-linear-three-unit.md + setupGitRepo + MockRuntime |
+| T13 | orchestrator.test.ts: **integrate-before-close invariant** | Drive with --once; after worker-finished, task is `in_progress` with `ce-beads:worker-finished` label and NOT closed; `bd ready` does NOT yet list U2; only after the full integrate cycle does U1 close and U2 become ready. Assert close-time ordering: no `close` call occurs before merge + verification in a spy-wrapped client. Grep-verifiable single-close-call-site (§8.5). | 02-linear-three-unit.md |
+| T14 | orchestrator.test.ts: **worker-base-sha freshness (P0-1)** | U2's worker_base_sha equals the integration worktree HEAD AFTER U1 was merged, NOT run.base_sha. U2's worktree contains U1's implementation (use fixture 18 where U2 imports U1's code). Verify by reading U1's file from U2's worktree. | 18-work-u2-depends-on-u1-impl.md |
+| T15 | orchestrator.test.ts: verification failure blocks | Failing-verification fixture: unit claimed, worker "completes", verification_commands fail → task labeled `ce-beads:blocked`, state blocked, NOT merged (integration worktree HEAD unchanged), NOT closed, outcome blocked, `VERIFICATION_FAILED` diagnostic, worktree PRESERVED (P1-5) | 17-work-failing-verification.md |
+| T16 | orchestrator.test.ts: invalid worker report blocks | MockRuntime writes invalid result file → WORKER_REPORT_INVALID, blocked, no merge, no close, worktree preserved | 02-linear-three-unit.md |
+| T17 | orchestrator.test.ts: **6-state crash recovery (P1-2)** | Crash-simulate at each transition: (a) after claim, before worker finished; (b) after worker_finished, before captured; (c) after captured, before merged; (d) after merged, before verified; (e) after verified, before closed; (f) after close, before marking run-state closed. Resume reconciles Git + Beads read-back and advances WITHOUT repeating durable mutations; repeats only idempotent mutations when the artifact is missing. No double-merge, no double-close. | 02-linear-three-unit.md |
+| T18 | orchestrator.test.ts: resume after full coordinator death between units | Run U1 via --once steps, then resume: loop picks U2 without re-claiming U1 (U1 closed, U2 ready from bd) | 02-linear-three-unit.md |
+| T19 | orchestrator.test.ts: run start refuses unbound / active (incl. blocked, P1-3) | Unbound plan → refused + NOT_BOUND + exit 4; second start while in_progress → refused + RUN_ACTIVE; start while a blocked run exists for the same plan → refused + RUN_ACTIVE (blocked runs are ownership-active) | 02-linear-three-unit.md |
+| T20 | orchestrator.test.ts: **artifact exclusion (P1-4)** | After capture+merge, the integration branch does NOT contain `.ce-beads-worker/` files. `git ls-tree` on the merge commit shows no `.ce-beads-worker/` entries. Engine uses explicit path staging from `report.changed_files`, never `git add -A`. | 02-linear-three-unit.md |
+| T21 | orchestrator.test.ts: reap cleans without touching Beads | Crash a run mid-flight; reap (non-force) → panes closed, worktrees/branches PRESERVED, run-state failed; every Beads task status unchanged. Reap with --force → preview shows the plan, approval gates destructive ops, worktrees/branches removed, paths validated to belong to the run. Lock acquired during reap. | 02-linear-three-unit.md |
+| T22 | orchestrator.test.ts: status snapshot | After partial run, `run status` reports inFlight U-ID, per-unit 6-state, readyCount; unknown id → not_found + exit 2 | 02-linear-three-unit.md |
+| T23 | cli.test.ts (extend): arg parsing | packet/run parse branches, --once/--force, usage gates (missing unit-id, bad runSub) → usage + exit 2; **--force outside run reap rejected (R11)** | — (pure parse) |
+| T24 | packaging.test.ts (extend): new skill layout + agent file at `agents/` (R9) | `skills/ce-beads-work/SKILL.md` frontmatter parses; `agents/ce-beads-unit.md` exists at package root and is included in `bun pm pack --dry-run` output; `package.json` `files` includes `"agents/"`; agent-file tools list equals `HERDR_WORKER_TOOLS` and contains no `task` | repo files |
+| T25 | packaging.test.ts (extend): **`--append-system-prompt` path-without-@ (P0-4)** | T21b: spawn `omp --profile chinese --model @smol --no-session --append-system-prompt <abs-path-without-@> -p "echo ok"` and assert the file's contents appear in the system prompt (not the literal path string). Use a fixture file in a temp dir. Skip with a clear message if `omp` is not on PATH in CI. | temp fixture |
+| T26 | regression: existing suites | `bun run verify` — bind/status/sync/doctor/plan-parser/graph-builder/beads-client/packaging/docs all green | existing 16 fixtures |
 
-MockRuntime contract (T11–T19): constructed with a script
+MockRuntime contract (T12–T22): constructed with a script
 `Record<U-ID, { writeFiles: Record<path,string>; report: WorkerReport |
 "malformed" | "die" }>`. `createWorkspace` does a REAL `git worktree add`
-(against the temp repo), `startWorker` applies `writeFiles` and **git-commits
-them on the worker branch** (the mock plays the coordinator-side commit the
-real adapter gets for free from the pane session's edits + a commit step),
-writes `result.json`, returns a handle. `wait` returns per script.
-`inspect`/`cleanup` are spy-recorded. This exercises real git merges and real
-bd transitions with zero Herdr.
-
-Note for the real adapter: since ce-beads-unit workers are forbidden from
-committing (agent rule 4), `HerdrRuntime.wait` — after sentinel — runs
-`git -C <worktree> add -A && git -C <worktree> commit -m "ce-beads(<U-ID>):
-worker changes (<run-id>)"` as the coordinator's capture step before the
-diff inspection. This keeps the worker's tree clean-room while giving the
-merge step a real branch tip. (MockRuntime models this by committing in
-startWorker.)
+(against the temp repo, from the engine-supplied forkSha — P0-1),
+`startWorker` applies `writeFiles` to the worktree and writes the result
+file (atomically), returns a handle. `wait` returns per script.
+`inspect`/`cleanup` are spy-recorded. **The MockRuntime does NOT commit**
+(P1-4/P1-5) — the engine's CAPTURE step does the commit, identical to the
+production path. This ensures CI exercises the real commit/integration
+code.
 
 ---
 
@@ -960,23 +1204,26 @@ bd --version                       # expect: 1.1.0
 
 | # | Observation | How to check |
 |---|-------------|--------------|
-| O1 | A new Herdr pane opens, labeled `ce-beads-U1-<run-id>`, running `omp --profile chinese --model @smol --no-session` | `herdr pane list` shows the label; `herdr pane process-info --pane <id>` |
-| O2 | Worker pane shows no `No API key found` error; status bar shows MiniMax-M3 | `herdr pane read <id> --source visible --lines 12` right after launch |
+| O1 | A new Herdr pane opens, labeled `ce-beads-U1-<run-id>`, running `omp --profile chinese --model @smol --no-session --tools <whitelist> --append-system-prompt <abs-path-without-@>` | `herdr pane list` shows the label; `herdr pane process-info --pane <id>` |
+| O2 | Worker pane shows no `No API key found` error; status bar shows MiniMax-M3; no `@` literal in system prompt | `herdr pane read <id> --source visible --lines 12` right after launch |
 | O3 | Worker does NOT call `bd` (no claim/update/close from the pane) | `herdr pane read <id> --source recent-unwrapped`; `bd list --json` assignee is the coordinator's claim only |
-| O4 | Worker prints exactly `CE_BEADS_RESULT:<run-id>:U1` on its own line, and `.ce-beads-worker/result.json` exists in the U1 worktree | pane read; `cat /tmp/ce-beads-wt/U1-<run-id>/.ce-beads-worker/result.json` |
-| O5 | U1's task is NOT closed before integration: after the worker finishes, `bd show <u1-id> --json` shows `in_progress` + label `ce-beads:awaiting-integration`; `bd ready --json` does NOT yet list U2 | `bd` CLI in the repo |
-| O6 | Coordinator closes U1 ONLY after merge + verification; then U2 becomes ready | `bd show`, `bd ready --json` before/after; `git -C /tmp/ce-beads-wt/integration-<run-id> log --oneline` shows the `--no-ff` merge |
-| O7 | Loop continues serially: exactly one worker pane at a time; U3 never starts before U2 closes | `herdr pane list` at any moment |
-| O8 | Crash recovery: while a worker is mid-run, kill the coordinator's driver (Ctrl-C the `bun … run start` process / interrupt the coordinator). Then `bun skills/ce-beads/scripts/cli.ts run resume <run-id> --json` re-attaches, waits for the same sentinel, and completes integration without re-claiming or re-launching | run-state file `.ce-beads/run-<run-id>.json` before/after; pane label unchanged |
-| O9 | When all units integrate: outcome `completed` with the integration-branch SHA; coordinator STOPS with a human notice; no ce-simplify/review/PR/push; `git branch` shows `main` untouched and `ce-beads/<slug>-<run-id>` holding the work | CLI envelope; `git log main..HEAD` on the integration branch |
-| O10 | Plans untouched: the fixture plan file is byte-identical before/after (SD7) | `git status` — no modification to tests/fixtures/plans/ |
+| O4 | Worker writes `.ce-beads-worker/result.json` atomically in the U1 worktree; file exists and validates | `cat /tmp/ce-beads-wt/U1-<run-id>/.ce-beads-worker/result.json` |
+| O5 | U1's task is NOT closed before integration: after the worker finishes, `bd show <u1-id> --json` shows `in_progress` + label `ce-beads:worker-finished` (or later `ce-beads:merged`/`verified`); `bd ready --json` does NOT yet list U2 | `bd` CLI in the repo |
+| O6 | **P0-1:** U2's worker worktree contains U1's implementation (U2's worker_base_sha = integration HEAD after U1 merged). Verify by reading a file U1 created from U2's worktree. | `git -C /tmp/ce-beads-wt/U2-<run-id> log --oneline`; `cat /tmp/ce-beads-wt/U2-<run-id>/<u1-file>` |
+| O7 | **P1-4:** Integration branch does NOT contain `.ce-beads-worker/` artifacts | `git -C /tmp/ce-beads-wt/integration-<run-id> ls-tree -r HEAD \| grep .ce-beads-worker` → empty |
+| O8 | Coordinator closes U1 ONLY after merge + verification; then U2 becomes ready | `bd show`, `bd ready --json` before/after; `git -C /tmp/ce-beads-wt/integration-<run-id> log --oneline` shows the `--no-ff -m` merge |
+| O9 | Loop continues serially: exactly one worker pane at a time; U3 never starts before U2 closes | `herdr pane list` at any moment |
+| O10 | **P1-2:** Crash recovery — while a worker is mid-run, kill the coordinator's driver. `bun skills/ce-beads/scripts/cli.ts run resume <run-id> --json` reconciles: reads back Git + Beads, advances durable states without repeating mutations, completes integration. | run-state file under `$GIT_DIR/ce-beads/`; `bd show` before/after |
+| O11 | When all units integrate: outcome `completed` with the integration-branch SHA; coordinator STOPS with a human notice; no ce-simplify/review/PR/push; `git branch` shows `main` untouched and `ce-beads/<slug>-<run-id>` holding the work | CLI envelope; `git log main..HEAD` on the integration branch |
+| O12 | Plans untouched: the fixture plan file is byte-identical before/after (SD7) | `git status` — no modification to tests/fixtures/plans/ |
+| O13 | **R10:** No `.ce-beads/` directory in the consumer repo working tree (run state lives under `$GIT_DIR/ce-beads/`) | `ls .ce-beads 2>/dev/null` → not found |
 
 ### Failure-path spot check (optional but recommended)
 
 Run the failing-verification fixture (`17-work-failing-verification.md`)
 through the same flow: expect the unit blocked, labeled `ce-beads:blocked`,
-NOT merged, NOT closed, outcome `blocked`, and the coordinator stopping for
-the human.
+NOT merged, NOT closed, outcome `blocked`, worktree PRESERVED for
+inspection, and the coordinator stopping for the human.
 
 ---
 
@@ -984,22 +1231,25 @@ the human.
 
 The milestone is done when ALL of the following hold:
 
-1. `skills/ce-beads-work/SKILL.md` and `.omp/agents/ce-beads-unit.md` exist,
+1. `skills/ce-beads-work/SKILL.md` and `agents/ce-beads-unit.md` exist,
    are committed on `feature/ce-orchestrate`, and are discoverable by the
    `chinese` OMP profile (skill appears in `/skill:` completion; agent file
-   present in the project agents dir).
-2. `bun run verify` is green: typecheck + all tests, including T1–T21 (the
-   mock-runtime loop test T11 and the integrate-before-close invariant test
-   T12) and the full pre-existing MVP suite with zero regressions (T22).
+   shipped at `agents/` and included in `bun pm pack` output).
+2. `bun run verify` is green: typecheck + all tests, including T1–T26 (the
+   mock-runtime loop test T12, the integrate-before-close invariant test
+   T13, the worker-base-sha freshness test T14, the 6-state recovery tests
+   T17, the artifact-exclusion test T20, the path-without-@ test T25) and
+   the full pre-existing MVP suite with zero regressions (T26).
 3. The manual acceptance test in §7 passes every required observation
-   O1–O10.
+   O1–O13.
 4. The five CLI actions behave exactly as specified: `packet` read-only;
    `run start/status/resume/reap` with the outcome/exit-code mapping in §4;
-   `run reap` never mutates Beads.
+   `run reap` never mutates Beads; `--force` rejected outside reap (R11).
 5. Integrate-before-close holds in the only place it can be violated: no
-   code path calls `BeadsClient.close` except the orchestrator's post-merge,
-   post-verification step (grep-verifiable: `grep -n "\.close("
-   skills/ce-beads-work/scripts/` shows exactly one call site).
+   code path calls `BeadsClient.close` except the orchestrator's
+   post-merge, post-verification step (grep-verifiable:
+   `grep -n "\.close(" skills/ce-beads-work/scripts/` shows exactly one
+   call site).
 6. All work is on `feature/ce-orchestrate`; `main` has no new commits;
    nothing is pushed or tagged.
 7. The implementation STOPS with a human notice at the shipping-tail
@@ -1011,22 +1261,27 @@ Parallel waves / file-contention scheduler; CE quality tail; Beads gates;
 formulas/molecules; marketplace/npm publish; alternative runtime adapters;
 multi-writer Beads; CE/Beads upstream modifications; HTML plans; direct
 Dolt / Beads MCP; writing progress into plans; ce-compound / `bd remember`;
-auto-merge/push/tag; plan-level Verification Contract table parsing (R8).
+auto-merge/push/tag.
 
 ## 10. Open questions the builder may hit (with defaults)
 
-1. **`omp --tools` tool-name acceptance** (R5): if `lsp`/`ast_grep` are
-   rejected by omp v17.0.6, drop them from the CLI whitelist only; keep the
-   agent file as-is; relax T21 to subset comparison. Verify once with
-   `omp --tools … --no-session -p "ok"` in a scratch dir before wiring
-   HerdrRuntime.
-2. **`herdr pane split` JSON field name**: the skill parses `result.pane_id`
+1. **`herdr pane split` JSON field name**: the skill parses `result.pane_id`
    but the observed `pane list` envelope uses `result.panes[].pane_id` and
    `pane get` uses `result.pane`. Pin the split-output field at build time
    with one manual `herdr pane split` probe; parse defensively
    (`result.pane_id ?? result.pane?.pane_id`).
+2. **`omp --tools` tool-name acceptance** (R5): if `lsp`/`ast_grep` are
+   rejected by omp v17.0.6, drop them from the CLI whitelist only; keep the
+   agent file as-is; relax T24 to subset comparison. Verify once with
+   `omp --tools … --no-session -p "ok"` in a scratch dir before wiring
+   HerdrRuntime. (T25 covers the `--append-system-prompt` path concern
+   separately.)
 3. **Prompt delivery size**: `herdr pane run <pane> '<prompt>'` passes the
    prompt as an argv string. Packets are a few KB — well under argv limits.
    If a plan produces an oversized packet (>32 KB), truncate
    `technical_design` in the prompt and point the worker at
    `.ce-beads-worker/packet.json` in the worktree (always written in full).
+4. **Goal Capsule / DoD / requirement definitions in the packet**: the
+   packet is sufficient for the serial MVP but is NOT yet the full bounded
+   CE packet (see §2.1 note). Extending `plan-parser.ts` to retain these
+   plan-level constructs is a documented follow-up, not in scope here.
