@@ -43,15 +43,8 @@ export const handler: ActionHandler = {
 
 function readExtension(args: CliArgs): {
   positional: string[];
-  options: Record<string, unknown>;
 } {
-  const positional = extractArray(args, "positional");
-  const optionsRaw = extractField(args, "options");
-  const options =
-    optionsRaw !== null && typeof optionsRaw === "object" && !Array.isArray(optionsRaw)
-      ? (optionsRaw as Record<string, unknown>)
-      : {};
-  return { positional, options };
+  return { positional: extractArray(args, "positional") };
 }
 
 function extractArray(obj: unknown, key: string): string[] {
@@ -64,16 +57,12 @@ function extractArray(obj: unknown, key: string): string[] {
   return [];
 }
 
-function extractField(obj: unknown, key: string): unknown {
-  if (obj !== null && typeof obj === "object" && key in obj) {
-    return (obj as Record<string, unknown>)[key];
-  }
-  return null;
-}
+
 async function runAction(args: CliArgs): Promise<ProtocolEnvelope> {
-  const { positional, options } = readExtension(args);
-  // positional[0] = "run", positional[1] = subcommand
-  const sub = positional[1] ?? (typeof options.runSub === "string" ? options.runSub : "");
+  const { positional } = readExtension(args);
+  // positional[0] = "run", positional[1] = subcommand; flags live on the
+  // dedicated CliArgs fields (cli.ts never puts them in the options bag).
+  const sub = positional[1] ?? args.runSub ?? "";
   const repoRoot = process.cwd();
   const beadsDir = process.env.BEADS_DIR ?? join(repoRoot, ".beads");
 
@@ -95,13 +84,13 @@ async function runAction(args: CliArgs): Promise<ProtocolEnvelope> {
       if (!planPath) {
         return envelope("run", false, "refused", null, [
           {
-            code: "PLAN_MALFORMED",
+            code: "USAGE",
             severity: "blocking",
             message: "Missing plan path. Usage: ce-beads run start <plan-path> [--once]",
           },
         ]);
       }
-      const once = options.once === true;
+      const once = args.once === true;
       return engine.start(planPath, { once });
     }
     case "status": {
@@ -119,8 +108,8 @@ async function runAction(args: CliArgs): Promise<ProtocolEnvelope> {
           },
         ]);
       }
-      const once = options.once === true;
-      const retry = options.retry === true;
+      const once = args.once === true;
+      const retry = args.retry === true;
       return engine.resume(runId, { once, retry });
     }
     case "reap": {
@@ -134,8 +123,8 @@ async function runAction(args: CliArgs): Promise<ProtocolEnvelope> {
           },
         ]);
       }
-      const force = options.force === true;
-      const applyToken = typeof options.apply === "string" ? options.apply : undefined;
+      const force = args.force === true;
+      const applyToken = args.applyToken;
       return engine.reap(runId, { force, ...(applyToken !== undefined ? { applyToken } : {}) });
     }
     case "abandon": {
@@ -149,14 +138,14 @@ async function runAction(args: CliArgs): Promise<ProtocolEnvelope> {
           },
         ]);
       }
-      const applyToken = typeof options.apply === "string" ? options.apply : undefined;
+      const applyToken = args.applyToken;
       return engine.abandon(runId, ...(applyToken !== undefined ? [{ applyToken }] : [{}]));
     }
     default: {
       void beadsDir;
       const diags: Diagnostic[] = [
         {
-          code: "PLAN_MALFORMED",
+          code: "USAGE",
           severity: "blocking",
           message: `Unknown run subcommand: "${sub}". Usage: ce-beads run {start|status|resume|reap|abandon} ...`,
         },

@@ -112,7 +112,9 @@ export function parseArgs(argv: string[]): CliArgs {
     } else if (arg === "--help" || arg === "-h") {
       help = true;
     } else if (!arg.startsWith("-")) {
-      if (!planPath) planPath = arg;
+      // For `run`, positional[1] is the subcommand — never the plan path.
+      const isRunSubcommand = action === "run" && positional.length === 1;
+      if (!planPath && !isRunSubcommand) planPath = arg;
       positional.push(arg);
     } else {
       // Capture --flag value pairs for options bag.
@@ -147,7 +149,7 @@ export function emit(
     stderr: (s) => process.stderr.write(s),
   },
 ): number {
-  const code = exitCodeFor(env.action, env.outcome, env.diagnostics);
+  const code = exitCodeFor(env.action, env.outcome, env.diagnostics, env.ok);
   if (json) {
     // JSON-only stdout; human diagnostics on stderr.
     stream.stdout(JSON.stringify(env) + "\n");

@@ -136,12 +136,10 @@ function emptyPacket(): WorkerPacket {
 
 async function packetAction(args: CliArgs): Promise<ProtocolEnvelope> {
   // 1. Parse positional args: [1] = plan path, [2] = U-ID. The cli.ts parser
-  //    places them in `positional` and `--unit` lands in `options.unit`.
-  const { positional, options } = readExtension(args);
+  //    places them in `positional` and `--unit` lands in `args.unitId`.
+  const { positional } = readExtension(args);
   const planPath = positional[1] ?? args.planPath;
-  const unitId =
-    (typeof options.unit === "string" ? options.unit : undefined) ??
-    positional[2];
+  const unitId = args.unitId ?? positional[2];
 
   if (!planPath) {
     return envelope(

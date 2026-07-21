@@ -872,8 +872,9 @@ function parseVerificationContract(body: string): VerificationEntry[] {
   const out: VerificationEntry[] = [];
   for (const row of rows) {
     const uRaw = row[uIdIdx] ?? "";
-    const cmd = row[cmdIdx] ?? "";
-    if (uRaw.trim() === "" || cmd.trim() === "") continue;
+    const rawCmd = row[cmdIdx] ?? "";
+    if (uRaw.trim() === "" || rawCmd.trim() === "") continue;
+    const cmd = rawCmd.replace(/^`+/, '').replace(/`+$/, '').trim();
     const expected = expIdx === -1 ? undefined : (row[expIdx] ?? "").trim();
     const uIds = uRaw
       .split(/[,\s]+|\s+and\s+/i)
@@ -883,9 +884,9 @@ function parseVerificationContract(body: string): VerificationEntry[] {
     const baseExpected = expected !== undefined && expected !== "" ? expected : undefined;
     for (const uId of uIds) {
       if (baseExpected === undefined) {
-        out.push({ unit_id: uId, command: cmd.trim() });
+        out.push({ unit_id: uId, command: cmd });
       } else {
-        out.push({ unit_id: uId, command: cmd.trim(), expected: baseExpected });
+        out.push({ unit_id: uId, command: cmd, expected: baseExpected });
       }
     }
   }

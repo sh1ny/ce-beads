@@ -7,7 +7,6 @@
 // the commit (identical to the production HerdrRuntime path). This ensures CI
 // exercises the real commit/integration code, not a mock shortcut.
 
-import { execFileSync } from "node:child_process";
 import { mkdir, rename, writeFile, readFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -169,22 +168,23 @@ class MockRuntime implements AgentRuntime {
   async cleanup(handle: WorkerHandle, opts: CleanupOpts): Promise<void> {
     const ws = handle.workspace;
     // opts.pane === "close" is a no-op for mock (no real pane).
+    // Order matters: remove the worktree FIRST, then delete the branch from
+    // the main repo. Trying to delete the branch while it's still checked
+    // out in the worktree makes git refuse; trying to remove the worktree
+    // after the branch is gone is also fragile. Use Bun.$ to match git.ts.
     if (opts.worktree === "remove") {
       try {
-        // git worktree remove works with the worktree path as cwd.
-        execFileSync("git", ["worktree", "remove", "--force", ws.worktreePath], { stdio: "ignore" });
+        await Bun.$`git worktree remove --force ${ws.worktreePath}`.quiet();
       } catch {
         // best-effort; worktree may already be gone
       }
     }
     if (opts.branch === "remove") {
       try {
-        // Branch deletion needs the main repo, not the worktree.
-        // Use execFileSync with -D flag.
-        execFileSync("git", ["branch", "-D", ws.branch], {
-          cwd: handle.workspace.worktreePath,
-          stdio: "ignore",
-        });
+        // Branch deletion must run from the main repo, not the worktree
+        // (worktree is gone now, and even if not, git refuses to delete
+        // the checked-out branch). Tests run from the repo root.
+        await Bun.$`git branch -D ${ws.branch}`.cwd(process.cwd()).quiet();
       } catch {
         // best-effort
       }

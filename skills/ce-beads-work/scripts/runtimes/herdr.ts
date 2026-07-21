@@ -125,7 +125,7 @@ export class HerdrRuntime implements AgentRuntime {
       "--", ...argv,
     ];
     if (this.workspaceId) {
-      args.splice(4, 0, "--workspace", this.workspaceId);
+      args.splice(3, 0, "--workspace", this.workspaceId);
     }
 
     let paneId: string | null = null;
@@ -139,15 +139,31 @@ export class HerdrRuntime implements AgentRuntime {
       }
       paneId = parsed.result?.agent?.pane_id ?? null;
     } catch (e) {
-      // Fallback (peer-agents pattern): manual pane split + pane run.
-      // Used when herdr agent start loses the process before detection.
+      // Before falling back, check if the primary launch actually succeeded
+      // despite the error (response-shape drift, warnings polluting stdout).
+      // Query herdr by agent name — if the pane exists, skip the fallback to
+      // avoid creating duplicate workers racing on the same files.
       const msg = (e as Error).message;
+      let alreadyLaunched = false;
       try {
-        paneId = await this.manualSplitStart(handle, prompt, disposableBeadsDir);
-      } catch (fallbackErr) {
-        throw new Error(
-          `herdr agent start failed (${msg}); manual fallback also failed: ${(fallbackErr as Error).message}`,
-        );
+        const getResult = await this.runHerdr(["agent", "get", agentName]);
+        const getParsed = JSON.parse(getResult.stdout) as HerdrAgentGetResponse;
+        if (!getParsed.error && getParsed.result?.agent?.pane_id) {
+          alreadyLaunched = true;
+          paneId = getParsed.result.agent.pane_id;
+        }
+      } catch {
+        // Agent not found — proceed with fallback.
+      }
+      if (!alreadyLaunched) {
+        // Fallback (peer-agents pattern): manual pane split + pane run.
+        try {
+          paneId = await this.manualSplitStart(handle, prompt, disposableBeadsDir);
+        } catch (fallbackErr) {
+          throw new Error(
+            `herdr agent start failed (${msg}); manual fallback also failed: ${(fallbackErr as Error).message}`,
+          );
+        }
       }
     }
 
@@ -416,13 +432,9 @@ interface HerdrAgentReadResponse {
 // --- Utility functions -----------------------------------------------------
 
 function resolveOmpBinary(): string {
-  // Herdr's spawn PATH may not include ~/.bun/bin. Resolve the full path.
-  // Try process.argv[1] (the running omp binary), then "omp" as fallback.
-  const argv1 = process.argv[1];
-  if (argv1 && argv1.includes("omp")) {
-    return resolve(argv1);
-  }
-  return "omp";
+  // Use Bun.which to resolve 'omp' via PATH (handles bun run and bundled contexts).
+  const resolved = Bun.which("omp");
+  return resolved ?? "omp";
 }
 
 function sleep(ms: number): Promise<void> {

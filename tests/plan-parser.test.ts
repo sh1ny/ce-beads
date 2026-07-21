@@ -244,7 +244,7 @@ describe("plan-parser: Verification Contract (R8)", () => {
     const plan = parsePlan(fixture("17-work-failing-verification.md"), { repoRoot: REPO_ROOT });
     const u1Cmd = plan.verification_commands.find((v) => v.unit_id === "U1");
     expect(u1Cmd).toBeDefined();
-    expect(u1Cmd!.command).toBe("`false`");
+    expect(u1Cmd!.command).toBe("false");
   });
 
   it("returns empty verification_commands when VC uses a blanket 'Unit' gate", () => {

@@ -4,7 +4,7 @@
 // exercise the identical commit/integration path.
 
 import { existsSync } from "node:fs";
-import { mkdir, writeFile, readFile } from "node:fs/promises";
+import { mkdir, rm, writeFile, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { CePlan, CeUnit, VerificationEntry } from "../../ce-beads/scripts/plan-parser.ts";
 import { parsePlan, PlanParseError } from "../../ce-beads/scripts/plan-parser.ts";
@@ -30,7 +30,7 @@ import {
 import type { WorkerReport } from "./worker-report.ts";
 import { validateWorkerReport, WORKER_RESULT_FILE } from "./worker-report.ts";
 import { buildWorkerPacket } from "./worker-packet.ts";
-import { renderWorkerPrompt, WORKER_AGENT_BODY } from "./worker-prompt.ts";
+import { renderWorkerPrompt, getWorkerAgentBody } from "./worker-prompt.ts";
 import {
   worktreeAdd,
   worktreeRemove,
@@ -42,7 +42,7 @@ import {
   commit,
   gitCommonDir,
 } from "./git.ts";
-import type { AgentRuntime, WorkerHandle, WorkerResult } from "./runtimes/runtime.ts";
+import type { AgentRuntime, WorkerHandle, WorkerResult, Workspace } from "./runtimes/runtime.ts";
 
 /** Unit states where work is in-flight (not yet closed, not pending/blocked). */
 const IN_FLIGHT_STATES: ReadonlySet<UnitRunState> = new Set([
@@ -299,7 +299,8 @@ export class RunEngine {
     // Preview without applyToken.
     if (!opts?.applyToken) {
       const preview = this.buildReapPreview(state);
-      return envelope("run", true, "preview", preview, []);
+      const token = reapToken(preview);
+      return envelope("run", true, "preview", { ...preview, approval_token: token }, []);
     }
 
     // Apply: validate token + execute cleanup.
@@ -385,7 +386,8 @@ export class RunEngine {
     // Preview without applyToken.
     if (!opts?.applyToken) {
       const preview = this.buildAbandonPreview(state);
-      return envelope("run", true, "preview", preview, []);
+      const token = abandonToken(preview);
+      return envelope("run", true, "preview", { ...preview, approval_token: token }, []);
     }
 
     // Apply: validate token.
@@ -418,6 +420,15 @@ export class RunEngine {
         }
         const taskRunId = task.metadata?.ce_beads_run_id;
 
+        // Skip tasks that don't belong to this run (another run claimed them).
+        if (taskRunId && taskRunId !== state.run_id) {
+          diagnostics.push({
+            code: "EXTERNAL_CHANGE",
+            severity: "warning",
+            message: `Task ${unit.beads_id} (${unitId}) is owned by run ${taskRunId}, not ${state.run_id}; skipping.`,
+          });
+          continue;
+        }
         // 2. Reopen: status open, assignee cleared.
         await client.update(unit.beads_id, {
           status: "open",
@@ -484,12 +495,28 @@ export class RunEngine {
     once: boolean,
     retry = false,
   ): Promise<ProtocolEnvelope> {
+    // 0. --retry: restore a blocked unit to its last successful state and
+    //    re-enter the loop at that step (ce-beads-7ch). The serial loop
+    //    guarantees at most one blocked unit at a time.
+    if (retry) {
+      for (const record of Object.values(state.units)) {
+        if (record.state !== "blocked" || !record.last_successful_state) continue;
+        record.state = record.last_successful_state;
+        record.last_successful_state = null;
+        record.blocker_reason = "";
+        record.attempt = (record.attempt || 0) + 1;
+        state.status = "in_progress";
+        saveRunState(state, this.repoRoot);
+        break;
+      }
+    }
+
     for (;;) {
-      // 1. Find in-flight unit (state >= worker_finished and < closed).
+      // 1. Find in-flight unit (state >= claimed and < closed).
       const inFlight = this.findInFlightUnit(state);
       if (inFlight) {
         // Resume integration from persisted state.
-        const result = await this.integrate(plan, client, state, inFlight.unitId, retry);
+        const result = await this.integrate(plan, client, state, inFlight.unitId);
         if (result.kind === "blocked") {
           state.status = state.status === "in_progress" ? "blocked" : state.status;
           saveRunState(state, this.repoRoot);
@@ -548,170 +575,15 @@ export class RunEngine {
       record.attempt = record.attempt || 1;
       saveRunState(state, this.repoRoot);
 
-      // 4c. P0-1: fork from integration worktree HEAD, not base_sha.
-      const forkSha = await revParse(state.integration_worktree, "HEAD");
-      record.worker_base_sha = forkSha;
-      saveRunState(state, this.repoRoot);
-
-      // 4d. Create workspace.
-      const ws = await this.runtime.createWorkspace(unit, state, forkSha);
-      record.worker_branch = ws.branch;
-      record.worktree_path = ws.worktreePath;
-      saveRunState(state, this.repoRoot);
-
-      // 4e. Build packet.
-      const verificationCommands = plan.verification_commands.filter(
-        (v: VerificationEntry) => v.unit_id === unitId,
-      );
-      const packet = buildWorkerPacket(plan, unit, verificationCommands, {
-        runId: state.run_id,
-        beadsId: readyTask.beadsId,
-        baseSha: forkSha,
-        branch: ws.branch,
-        worktreePath: ws.worktreePath,
-        resultFile: join(ws.worktreePath, WORKER_RESULT_FILE),
-      });
-
-      // 4f. Write worker artifacts (system-prompt + packet.json).
-      const workerDir = join(ws.worktreePath, ".ce-beads-worker");
-      await mkdir(workerDir, { recursive: true });
-      await writeFile(join(workerDir, "system-prompt.md"), WORKER_AGENT_BODY, "utf8");
-      await writeFile(join(workerDir, "packet.json"), JSON.stringify(packet, null, 2), "utf8");
-
-      // 4g1. Start worker phase 1 (create pane + detect agent).
-      let handle: WorkerHandle;
-      try {
-        handle = await this.runtime.startWorkerPhase1(ws);
-        record.worker_pane_id = handle.paneId;
-        record.prompt_lifecycle = "not_sent";
+      // 4c-4h. Dispatch the worker: workspace, packet, phases 1-2, wait.
+      const dispatch = await this.dispatchWorker(plan, client, state, unitId, readyTask.beadsId);
+      if (dispatch.kind === "blocked") {
         saveRunState(state, this.repoRoot);
-      } catch (e) {
-        record.state = "blocked";
-        record.last_successful_state = "claimed";
-        record.blocker_reason = `Phase 1 failed: ${(e as Error).message}`;
-        state.status = "failed";
-        saveRunState(state, this.repoRoot);
-        return this.statusEnvelope(state, "failed", [
-          {
-            code: "RUNTIME_FAILURE",
-            severity: "blocking",
-            message: `Worker phase 1 failed for ${unitId}: ${(e as Error).message}`,
-          },
-        ]);
-      }
-
-      // 4g2. Start worker phase 2 (send prompt).
-      const prompt = renderWorkerPrompt(packet);
-      handle.promptLifecycle = "dispatching";
-      record.prompt_lifecycle = "dispatching";
-      saveRunState(state, this.repoRoot);
-      try {
-        await this.runtime.startWorkerPhase2(handle, prompt);
-        handle.promptLifecycle = "sent";
-        record.prompt_lifecycle = "sent";
-        saveRunState(state, this.repoRoot);
-      } catch (e) {
-        record.state = "blocked";
-        record.last_successful_state = "claimed";
-        record.blocker_reason = `Phase 2 failed: ${(e as Error).message}`;
-        state.status = "failed";
-        saveRunState(state, this.repoRoot);
-        return this.statusEnvelope(state, "failed", [
-          {
-            code: "RUNTIME_FAILURE",
-            severity: "blocking",
-            message: `Worker phase 2 failed for ${unitId}: ${(e as Error).message}`,
-          },
-        ]);
-      }
-
-      // 4h. Wait for completion (file-based).
-      const waitResult: WorkerResult = await this.runtime.wait(handle, {
-        timeoutMs: this.workerTimeoutMs,
-      });
-
-      if (waitResult.kind === "completed") {
-        const report = waitResult.report;
-        record.result = report;
-        if (report.status === "complete") {
-          record.state = "worker_finished";
-          record.last_successful_state = "claimed";
-          await client.update(readyTask.beadsId, {
-            setMetadata: { ce_beads_run_state: "worker_finished" },
-            addLabel: ["ce-beads:worker-finished"],
-          });
-          saveRunState(state, this.repoRoot);
-        } else if (report.status === "blocked") {
-          record.state = "blocked";
-          record.last_successful_state = "worker_finished";
-          record.blocker_reason = report.blockers;
-          state.status = "blocked";
-          await client.update(readyTask.beadsId, {
-            setMetadata: {
-              ce_beads_run_state: "blocked",
-              ce_beads_blocker_reason: report.blockers,
-            },
-            addLabel: ["ce-beads:blocked"],
-          });
-          saveRunState(state, this.repoRoot);
-          return this.statusEnvelope(state, "blocked", [
-            {
-              code: "WORKER_BLOCKED",
-              severity: "blocking",
-              message: `Worker reported blocked for ${unitId}: ${report.blockers}`,
-            },
-          ]);
-        } else {
-          // failed
-          record.state = "blocked";
-          record.last_successful_state = "worker_finished";
-          record.blocker_reason = report.blockers || "worker reported failure";
-          state.status = "failed";
-          await client.update(readyTask.beadsId, {
-            setMetadata: {
-              ce_beads_run_state: "blocked",
-              ce_beads_blocker_reason: record.blocker_reason,
-            },
-            addLabel: ["ce-beads:blocked"],
-          });
-          saveRunState(state, this.repoRoot);
-          return this.statusEnvelope(state, "failed", [
-            {
-              code: "WORKER_FAILED",
-              severity: "blocking",
-              message: `Worker reported failure for ${unitId}: ${record.blocker_reason}`,
-            },
-          ]);
-        }
-      } else {
-        // timeout or died — preserve worktree.
-        record.state = "blocked";
-        record.last_successful_state = "claimed";
-        record.blocker_reason =
-          waitResult.kind === "timeout" ? "worker timeout" : waitResult.reason;
-        state.status = waitResult.kind === "timeout" ? "blocked" : "failed";
-        await client.update(readyTask.beadsId, {
-          setMetadata: { ce_beads_run_state: "blocked" },
-          addLabel: ["ce-beads:blocked"],
-        });
-        // Best-effort cleanup: close pane, PRESERVE worktree.
-        try {
-          await this.runtime.cleanup(handle, {
-            pane: "close",
-            worktree: "preserve",
-            branch: "preserve",
-          });
-        } catch {
-          // best-effort
-        }
-        saveRunState(state, this.repoRoot);
-        return this.statusEnvelope(state, state.status, [
-          {
-            code: "WORKER_FAILED",
-            severity: "blocking",
-            message: `Worker ${waitResult.kind} for ${unitId}: ${record.blocker_reason}`,
-          },
-        ]);
+        return this.statusEnvelope(
+          state,
+          state.status === "in_progress" ? "blocked" : state.status,
+          dispatch.diagnostics,
+        );
       }
 
       // 5. INTEGRATE.
@@ -726,6 +598,156 @@ export class RunEngine {
     }
   }
 
+  // --- Worker dispatch (workspace → packet → phase 1/2 → wait) ------------
+
+  /**
+   * Fork (or reuse) the worker workspace, write worker artifacts, start the
+   * worker, and wait for its report. On success the record advances to
+   * worker_finished; on any failure the unit is blocked and state.status set.
+   *
+   * Shared by the initial claim path in driveLoop and the claimed-state
+   * resume path in integrate (ce-beads-7i7).
+   */
+  private async dispatchWorker(
+    plan: CePlan,
+    client: BeadsClient,
+    state: RunState,
+    unitId: string,
+    beadsId: string,
+  ): Promise<{ kind: "finished" } | { kind: "blocked"; diagnostics: Diagnostic[] }> {
+    const unit = plan.units.find((u) => u.id === unitId)!;
+    const record = state.units[unitId]!;
+
+    // Fork from integration worktree HEAD (P0-1) unless resuming into an
+    // already-forked workspace (crash between claim and worker finish).
+    let ws: Workspace;
+    if (record.worktree_path && record.worker_branch && existsSync(record.worktree_path)) {
+      ws = {
+        unitId,
+        worktreePath: record.worktree_path,
+        branch: record.worker_branch,
+      };
+      // Clear any stale result file from a previous attempt (R3).
+      await rm(join(ws.worktreePath, WORKER_RESULT_FILE), { force: true });
+    } else {
+      const forkSha = await revParse(state.integration_worktree, "HEAD");
+      record.worker_base_sha = forkSha;
+      ws = await this.runtime.createWorkspace(unit, state, forkSha);
+      record.worker_branch = ws.branch;
+      record.worktree_path = ws.worktreePath;
+      saveRunState(state, this.repoRoot);
+    }
+
+    // Build packet.
+    const verificationCommands = plan.verification_commands.filter(
+      (v: VerificationEntry) => v.unit_id === unitId,
+    );
+    const packet = buildWorkerPacket(plan, unit, verificationCommands, {
+      runId: state.run_id,
+      beadsId,
+      baseSha: record.worker_base_sha!,
+      branch: ws.branch,
+      worktreePath: ws.worktreePath,
+      resultFile: join(ws.worktreePath, WORKER_RESULT_FILE),
+    });
+
+    // Write worker artifacts (system-prompt + packet.json).
+    const workerDir = join(ws.worktreePath, ".ce-beads-worker");
+    await mkdir(workerDir, { recursive: true });
+    await writeFile(join(workerDir, "system-prompt.md"), getWorkerAgentBody(), "utf8");
+    await writeFile(join(workerDir, "packet.json"), JSON.stringify(packet, null, 2), "utf8");
+
+    // Start worker phase 1 (create pane + detect agent).
+    let handle: WorkerHandle;
+    try {
+      handle = await this.runtime.startWorkerPhase1(ws);
+      record.worker_pane_id = handle.paneId;
+      record.prompt_lifecycle = "not_sent";
+      saveRunState(state, this.repoRoot);
+    } catch (e) {
+      state.status = "failed";
+      return this.blockUnit(state, client, record, unitId, "claimed", {
+        code: "RUNTIME_FAILURE",
+        severity: "blocking",
+        message: `Worker phase 1 failed for ${unitId}: ${(e as Error).message}`,
+      });
+    }
+
+    // Start worker phase 2 (send prompt).
+    const prompt = renderWorkerPrompt(packet);
+    handle.promptLifecycle = "dispatching";
+    record.prompt_lifecycle = "dispatching";
+    saveRunState(state, this.repoRoot);
+    try {
+      await this.runtime.startWorkerPhase2(handle, prompt);
+      handle.promptLifecycle = "sent";
+      record.prompt_lifecycle = "sent";
+      // ce-beads-ao6: phase 2 may assign the real pane id — persist it.
+      record.worker_pane_id = handle.paneId;
+      saveRunState(state, this.repoRoot);
+    } catch (e) {
+      state.status = "failed";
+      return this.blockUnit(state, client, record, unitId, "claimed", {
+        code: "RUNTIME_FAILURE",
+        severity: "blocking",
+        message: `Worker phase 2 failed for ${unitId}: ${(e as Error).message}`,
+      });
+    }
+
+    // Wait for completion (file-based).
+    const waitResult: WorkerResult = await this.runtime.wait(handle, {
+      timeoutMs: this.workerTimeoutMs,
+    });
+
+    if (waitResult.kind === "completed") {
+      const report = waitResult.report;
+      record.result = report;
+      if (report.status === "complete") {
+        record.state = "worker_finished";
+        record.last_successful_state = "claimed";
+        await client.update(beadsId, {
+          setMetadata: { ce_beads_run_state: "worker_finished" },
+          addLabel: ["ce-beads:worker-finished"],
+        });
+        saveRunState(state, this.repoRoot);
+        return { kind: "finished" };
+      }
+      // blocked/failed report — the work product is unusable, so a later
+      // --retry restores "claimed" and re-runs the worker (ce-beads-7ch).
+      state.status = report.status === "blocked" ? "blocked" : "failed";
+      return this.blockUnit(state, client, record, unitId, "claimed", {
+        code: report.status === "blocked" ? "WORKER_BLOCKED" : "WORKER_FAILED",
+        severity: "blocking",
+        message:
+          report.status === "blocked"
+            ? `Worker reported blocked for ${unitId}: ${report.blockers}`
+            : `Worker reported failure for ${unitId}: ${report.blockers || "worker reported failure"}`,
+      });
+    }
+
+    // timeout or died — preserve worktree.
+    state.status = waitResult.kind === "timeout" ? "blocked" : "failed";
+    const blocked = await this.blockUnit(state, client, record, unitId, "claimed", {
+      code: "WORKER_FAILED",
+      severity: "blocking",
+      message: `Worker ${waitResult.kind} for ${unitId}: ${
+        waitResult.kind === "timeout" ? "worker timeout" : waitResult.reason
+      }`,
+    });
+    // Best-effort cleanup: close pane, PRESERVE worktree.
+    try {
+      await this.runtime.cleanup(handle, {
+        pane: "close",
+        worktree: "preserve",
+        branch: "preserve",
+      });
+    } catch {
+      // best-effort
+    }
+    saveRunState(state, this.repoRoot);
+    return blocked;
+  }
+
   // --- INTEGRATE (6-state machine) ----------------------------------------
 
   private async integrate(
@@ -733,13 +755,19 @@ export class RunEngine {
     client: BeadsClient,
     state: RunState,
     unitId: string,
-    retry = false,
   ): Promise<{ kind: "done" } | { kind: "blocked"; diagnostics: Diagnostic[] }> {
     const unit = plan.units.find((u) => u.id === unitId)!;
     const record = state.units[unitId]!;
-    const diagnostics: Diagnostic[] = [];
 
-    // 5a. If worker_finished → capture.
+    // 5a. If claimed (resume/retry before the worker finished) → (re)launch
+    // the worker and wait for its report (ce-beads-7i7). Without this branch
+    // a claimed unit falls through and resume hot-loops forever.
+    if (record.state === "claimed") {
+      const dispatch = await this.dispatchWorker(plan, client, state, unitId, record.beads_id);
+      if (dispatch.kind === "blocked") return dispatch;
+    }
+
+    // 5b. If worker_finished → capture.
     if (record.state === "worker_finished") {
       // 5b. CAPTURE: validate changed_files + commit.
       const report = record.result!;
@@ -893,7 +921,6 @@ export class RunEngine {
       }
     }
 
-    void diagnostics;
     return { kind: "done" };
   }
 
