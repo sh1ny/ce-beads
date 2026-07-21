@@ -203,3 +203,122 @@ Observed results matched every expected observation:
    dependency.
 
 U11 acceptance is complete.
+
+---
+
+## ce-beads-work serial orchestrator acceptance (pending)
+
+Manual acceptance gate for the `ce-beads-work` orchestrator skill. This
+procedure exercises the `packet` and `run` actions with real Herdr-backed
+OMP workers. Only the human runs this gate.
+
+### Prerequisites
+
+- All prerequisites from Step 0 above (linked plugin, `bd`, Bun, OMP)
+- **Herdr** installed and on PATH (`herdr --version`)
+- The `ce-beads-unit.md` worker agent file at `agents/ce-beads-unit.md`
+- A consumer git repo with at least one commit
+
+### Step W0 — Prepare the consumer project
+
+```bash
+export CE_CONSUMER="$(mktemp -d -t ce-beads-work-consumer-XXXXXX)"
+export BEADS_DIR="$(mktemp -d -t ce-beads-work-beads-XXXXXX)"
+cd "$CE_CONSUMER"
+git init && git config user.email "t@t.com" && git config user.name "T"
+echo "# consumer" > README.md && git add . && git commit -m init
+bd init --non-interactive --init-if-missing --skip-agents --skip-hooks --stealth
+cp <repo>/tests/fixtures/plans/02-linear-three-unit.md ./plan.md
+```
+
+### Step W1 — Bind the plan
+
+Bind `plan.md` via the ce-beads skill (preview then apply). Verify with
+`ce-beads status plan.md --json` — shows 1 epic + 3 tasks.
+
+### Step W2 — Build a worker packet (read-only)
+
+```bash
+ce-beads packet plan.md U1 --json
+```
+
+Expected: `outcome: "packet_built"`, `ok: true`, with `packet.unit.id === "U1"`,
+`packet.beads_id` matching the Beads task ID, and `packet.verification_commands`
+populated from the plan's Verification Contract.
+
+### Step W3 — Start a serial orchestrator run
+
+```bash
+ce-beads run start plan.md --json
+```
+
+Expected: the orchestrator launches a Herdr-backed OMP worker for U1, waits
+for the worker's result file, captures and commits the worker's changes,
+runs verification, merges into the integration branch, and closes the Beads
+task. Then proceeds to U2, U3 serially.
+
+Final outcome: `outcome: "completed"`, `ok: true`, all units in `closed` state.
+
+### Step W4 — Verify integrate-before-close invariant
+
+After the run completes:
+
+1. The integration branch (`ce-beads/<run-id>`) contains all unit files.
+2. Each Beads task is `closed` — closed only after merge + verification.
+3. `git log` on the integration branch shows per-unit commits.
+4. No `.ce-beads-worker/` artifacts appear in the integration branch.
+
+### Step W5 — Crash recovery (resume)
+
+Kill the orchestrator mid-run (after U1 is claimed but before it closes). Then:
+
+```bash
+ce-beads run resume plan.md --json
+```
+
+Expected: the engine reads back persisted run-state from `$GIT_DIR/ce-beads/`,
+reconciles Git + Beads state, and resumes from the correct transition point
+without double-claiming, double-merging, or double-closing.
+
+### Step W6 — Reap an orphaned run
+
+```bash
+ce-beads run reap plan.md --json                          # preview
+ce-beads run reap plan.md --force --apply <token> --json  # destructive
+```
+
+Expected: preview shows the plan and run ID; `--force --apply` closes panes,
+removes worktrees/branches, marks the run failed. Beads tasks are NOT mutated
+by reap (use `run abandon` for that).
+
+### Step W7 — Abandon (release Beads ownership)
+
+```bash
+ce-beads run abandon plan.md --json                       # preview
+ce-beads run abandon plan.md --apply <token> --json       # apply
+```
+
+Expected: preview shows tasks to release; `--apply` clears assignees, removes
+`ce-beads:` labels and `ce_beads_run_id` metadata. Run marked `abandoned`.
+
+### Expected observable results
+
+1. **packet**: read-only, no Beads mutation, `beads_id` resolved from binding.
+2. **run start**: serial loop drives all units to `closed`; integration branch
+   contains all unit files.
+3. **integrate-before-close**: no `close` call before merge + verification.
+4. **crash recovery**: resume reconciles state without double-mutations.
+5. **reap**: preview-gated; `--force` cleans worktrees/branches; Beads untouched.
+6. **abandon**: releases Beads task ownership; preview-then-apply approval flow.
+7. **artifact exclusion**: `.ce-beads-worker/` never appears on the integration branch.
+8. **run-state location**: state under `$GIT_DIR/ce-beads/`, not the working tree.
+
+### Notes
+
+- The HerdrRuntime uses `herdr agent start` with prompt-as-argv (pi-overseer
+  pattern). Worker completion is signaled by the atomic existence of
+  `.ce-beads-worker/result.json`.
+- The worker agent (`agents/ce-beads-unit.md`) has a restricted tool
+  whitelist (no `task`, no `bd`) — defense-in-depth, not a security boundary.
+- The orchestrator persists every state transition to disk; crash recovery
+  reads back Git + Beads state and resumes idempotently.
