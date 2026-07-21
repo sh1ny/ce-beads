@@ -34,7 +34,8 @@
   ],
   "omp": {
     "name": "ce-beads",
-    "description": "Bridge Compound Engineering implementation-ready plans into Beads dependency graphs."
+    "description": "Bridge Compound Engineering implementation-ready plans into Beads dependency graphs.",
+    "skills": ["./skills"]
   },
   "scripts": {
     "test": "bun test --timeout 30000",

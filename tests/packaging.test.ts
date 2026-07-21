@@ -40,6 +40,7 @@ describe("packaging: manifest", () => {
     expect(pkg.omp).toEqual({
       name: "ce-beads",
       description: "Bridge Compound Engineering implementation-ready plans into Beads dependency graphs.",
+      skills: ["./skills"],
     });
   });
 
