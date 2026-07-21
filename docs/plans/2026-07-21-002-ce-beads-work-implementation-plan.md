@@ -244,7 +244,7 @@ file (which lives at `agents/`).
 | # | Path | Kind | Depends on |
 |---|------|------|------------|
 | 1 | `skills/ce-beads/scripts/protocol.ts` | modify: extend `Action`, add `PacketOutcome`/`RunOutcome`, 10 new `DiagnosticCode`s, extend `exitCodeFor` | — |
-| 2 | `skills/ce-beads/scripts/plan-parser.ts` | modify: parse Verification Contract table into typed entries (R8) | — |
+| 2 | `skills/ce-beads/scripts/plan-parser.ts` | modify: parse Verification Contract table into typed entries (R8); parse requirement definitions (R-ID → text) and KTD excerpts (KTD-ID → text) into `CePlan.requirement_defs` and per-unit `CeUnit.ktd_excerpts`; select KTDs per unit by matching requirement IDs referenced by the unit | — |
 | 3 | `skills/ce-beads-work/scripts/worker-packet.ts` | create: `WorkerPacket` types + `buildWorkerPacket()` | 1, 2 |
 | 4 | `skills/ce-beads-work/scripts/packet.ts` | create: `packet` action handler | 1, 3 |
 | 5 | `skills/ce-beads-work/scripts/worker-report.ts` | create: `WorkerReport` schema + `validateWorkerReport()` | — |
@@ -604,6 +604,15 @@ export interface WorkerHandle {
   /** Absolute path to .ce-beads-worker/result.json (R3 completion signal). */
   resultFile: string;
   startedAt: string;      // ISO
+  /**
+   * Prompt dispatch lifecycle (crash recovery, P1-2 v4):
+   *   not_sent      → phase 1 done (pane exists), prompt not yet delivered
+   *   dispatching   → phase 2 in progress (prompt being sent)
+   *   sent          → phase 2 done, awaiting worker result
+   * Resume checks this field to decide whether to re-send the prompt
+   * (not_sent/dispatching) or skip to wait (sent).
+   */
+  promptLifecycle: "not_sent" | "dispatching" | "sent";
 }
 
 export interface WaitOpts {
@@ -622,11 +631,14 @@ export type WorkerState = "running" | "finished" | "dead" | "unknown";
 
 export interface CleanupOpts {
   /**
-   * If true, remove the worktree and delete the branch. If false (default),
-   * preserve them for human inspection. Always closes the pane (if any).
-   * Destructive cleanup is preview/approval-gated at the engine level (P1-5).
+   * Separate actions for pane, worktree, and branch (reap preview fix):
+   * - "close" pane: always done if pane exists
+   * - "preserve" | "remove" worktree: remove only with --force
+   * - "preserve" | "remove" branch: remove only with --force
    */
-  destructive: boolean;
+  pane: "close";
+  worktree: "preserve" | "remove";
+  branch: "preserve" | "remove";
 }
 
 export interface AgentRuntime {
@@ -636,8 +648,23 @@ export interface AgentRuntime {
    * explicitly so the runtime doesn't have to re-derive it.
    */
   createWorkspace(unit: CeUnit, run: RunState, forkSha: string): Promise<Workspace>;
-  /** Launch the worker session and deliver the prompt. */
-  startWorker(ws: Workspace, prompt: string): Promise<WorkerHandle>;
+  /**
+   * Phase 1: create the pane, launch omp, poll for agent detection.
+   * Returns a handle with promptLifecycle = "not_sent". The engine
+   * persists the pane_id IMMEDIATELY after this returns (before phase 2).
+   * A crash between phase 1 and phase 2 is recoverable: resume finds the
+   * pane by its label (ce-beads-<U-ID>-<run-id>) and re-invokes phase 2.
+   */
+  startWorkerPhase1(ws: Workspace): Promise<WorkerHandle>;
+  /**
+   * Phase 2: send the prompt to the already-running pane. Does NOT create
+   * or rename anything. Sets promptLifecycle to "sent" on return.
+   * A crash after phase 2 returns but before state save may cause
+   * duplicate prompt delivery on resume — acceptable (idempotent from
+   * the worker's perspective: it sees the prompt again, may produce
+   * the same result file).
+   */
+  startWorkerPhase2(handle: WorkerHandle, prompt: string): Promise<void>;
   /**
    * File-based completion wait (R3): poll handle.resultFile for existence.
    * Lifecycle status (runtime.inspect) is an advisory fast-path hint only.
@@ -646,9 +673,9 @@ export interface AgentRuntime {
   /** Non-blocking state probe; used by crash recovery. */
   inspect(handle: WorkerHandle): Promise<WorkerState>;
   /**
-   * Close pane (if any). If opts.destructive, remove worktree + delete
-   * branch; otherwise preserve them. Never touches Beads. Receives the
-   * full handle so it can close the pane after a restart (P1-5).
+   * Close pane (if any). Worktree/branch actions per opts. Never touches
+   * Beads. Receives the full handle so it can close the pane after a
+   * restart (P1-5).
    */
   cleanup(handle: WorkerHandle, opts: CleanupOpts): Promise<void>;
 }
@@ -690,7 +717,8 @@ export const HERDR_WORKER_TOOLS = [
 export class HerdrRuntime implements AgentRuntime {
   constructor(opts: HerdrRuntimeOptions);
   createWorkspace(unit: CeUnit, run: RunState, forkSha: string): Promise<Workspace>;
-  startWorker(ws: Workspace, prompt: string): Promise<WorkerHandle>;
+  startWorkerPhase1(ws: Workspace): Promise<WorkerHandle>;
+  startWorkerPhase2(handle: WorkerHandle, prompt: string): Promise<void>;
   wait(handle: WorkerHandle, opts: WaitOpts): Promise<WorkerResult>;
   inspect(handle: WorkerHandle): Promise<WorkerState>;
   cleanup(handle: WorkerHandle, opts: CleanupOpts): Promise<void>;
@@ -712,7 +740,7 @@ parses the `{"id":…,"result":…}` JSON envelope):
   building the packet in loop step 4f. The worker creates `.result.tmp`,
   writes it, and renames it to `result.json`; the adapter polls for
   `result.json` existence (R3).
-- `startWorker`:
+- `startWorkerPhase1(ws)`:
   1. `herdr pane split --current --direction right --no-focus` → parse
      `result.pane_id` (fall back to `result.pane?.pane_id` and `down`
      direction on failure — field name verified at build time, defensive
@@ -731,9 +759,13 @@ parses the `{"id":…,"result":…}` JSON envelope):
   5. `herdr pane read <pane_id> --source visible --lines 12`; if it contains
      `No API key found` → close pane, throw (caller maps to
      `RUNTIME_FAILURE` → outcome `failed`).
-  6. Deliver the prompt: `herdr pane run <pane_id> '<rendered prompt>'`
-     (prompt includes the result-file path; see §3). Never treat the
-     pre-prompt `idle` as completion (skill gotcha).
+  6. Return WorkerHandle with paneId set, promptLifecycle = "not_sent".
+     The engine persists pane_id IMMEDIATELY.
+- `startWorkerPhase2(handle, prompt)`:
+  1. `herdr pane run <pane_id> '<rendered prompt>'` (prompt includes
+     the result-file path; see §3). Never treat the pre-prompt `idle`
+     as completion (skill gotcha).
+  2. Set handle.promptLifecycle = "sent". Return.
 - `wait`: loop until `opts.timeoutMs`:
   - **Deterministic path (authoritative, R3):** check
     `fs.existsSync(handle.resultFile)`. If present, read + validate via
@@ -747,12 +779,13 @@ parses the `{"id":…,"result":…}` JSON envelope):
     the truth).
 - `inspect`: `herdr pane get` → pane missing → `dead`; result file exists
   → `finished`; `agent_status === "working"` → `running`; else `unknown`.
-- `cleanup`: `herdr pane close <handle.paneId>` (best-effort, always). If
-  `opts.destructive`: `git worktree remove --force <path>`,
-  `git branch -D <branch>` — but ONLY after the engine has confirmed
-  (preview + approval) that the unit is abandoned. Non-destructive default
-  preserves the worktree and branch for human inspection.
-
+- `cleanup`: per `CleanupOpts`:
+  - `opts.pane === "close"`: `herdr pane close <handle.paneId>` (best-effort).
+  - `opts.worktree === "remove"`: `git worktree remove --force <path>`.
+  - `opts.branch === "remove"`: `git branch -D <branch>`.
+  - `opts.worktree === "preserve"` and `opts.branch === "preserve"`: do
+    nothing (leave for human inspection). Only used for failed/blocked
+    units or non-force reap.
 ### 2.6 `orchestrator.ts` — the RunEngine
 
 ```ts
@@ -775,25 +808,30 @@ export class RunEngine {
    * run start: parse plan → verify binding (NOT_BOUND refusal if unbound;
    * the coordinator agent runs the existing `bind` preview→approval→apply
    * flow first) → refuse on active run for the plan (RUN_ACTIVE — includes
-   * blocked runs, P1-3) → create integration branch + integration worktree
-   * → write run-state → drive loop.
+   * blocked + failed-with-unfinished, P1-3) → **write an initializing
+   * run-state FIRST** (status=in_progress, base_sha, plan_path,
+   * plan_digest, empty units — persisted BEFORE any integration worktree
+   * creation so a crash during setup is recoverable) → create integration
+   * branch + integration worktree → update run-state with
+   * integration_branch + integration_worktree → drive loop.
    */
   start(planPath: string, opts?: { once?: boolean }): Promise<ProtocolEnvelope>;
 
   /**
    * run resume: load run-state → reconcile in-flight unit via the 6-state
-   * machine (run-state.ts doc): read back Git + Beads for each non-closed
-   * unit; advance durable states without repeating mutations; repeat only
-   * idempotent mutations when the durable artifact is missing → drive loop.
    *
    * When opts.retry is true and a unit is blocked, the engine reads the
-   * unit's last_successful_state and re-enters the loop from that state
-   * (e.g. if blocked at captured, re-attempt merge). The blocked unit's state
-   * transitions from blocked back to last_successful_state. If
-   * last_successful_state is null (blocked at claimed), re-claim is attempted
-   * (the bd claim is idempotent if already claimed by the same coordinator).
-   * Without --retry, a blocked unit is skipped and the loop continues to the
-   * next ready task (or exits blocked if nothing else is ready).
+   * unit's last_successful_state and re-enters the loop at the correct
+   * step for that state (see loop step 2b for the full routing table:
+   * captured→5d verify, merged→5f verify, verified→5g close, claimed→4d
+   * re-launch worker, worker_finished with blocked/failed report→4d
+   * re-launch worker, worker_finished with complete report→5b capture).
+   * Merge-conflict blocks are NOT auto-retried (human must resolve).
+   *
+   * In the serial MVP, a blocked run STOPS — the loop does not skip
+   * blocked units and continue to others. --retry is the only way to
+   * re-attempt a blocked unit. Without --retry, resume on a blocked
+   * run returns outcome "blocked" immediately.
    */
   resume(runId: string, opts?: { once?: boolean; retry?: boolean }): Promise<ProtocolEnvelope>;
 
@@ -826,11 +864,37 @@ export class RunEngine {
 
   /**
    * run abandon: releases coordinator-owned Beads state for a blocked/failed
-   * run. For each non-closed unit: bd update to unclaim (set assignee null,
-   * status back to open). Does NOT close or delete tasks. After abandon,
-   * the run is marked "abandoned" (new RunStatus value) and is no longer
-   * active — a fresh run can start. Requires preview→apply approval (same
-   * pattern as reap). NEVER deletes worktrees or branches (use reap for that).
+   * run. For each non-closed unit (per the preview):
+   *
+   * Beads mutation contract:
+   * 1. Read back the task's current assignee via `bd show <id> --json`.
+   *    If assignee does NOT match this run's coordinator identity →
+   *    EXTERNAL_CHANGE diagnostic, skip this task, continue to next.
+   *    (Another run or human took ownership — do NOT unclaim.)
+   * 2. Unclaim: `bd assign <id> ""` (clears assignee; status reverts to
+   *    open). The existing BeadsClient.update() cannot clear an assignee,
+   *    so extend it: `update(id, { assignee?: string })` where
+   *    `assignee === ""` clears it (test using `!== undefined`).
+   *    Alternatively call `bd assign <id> ""` directly — both are valid;
+   *    the plan pins `bd assign` as the implementation.
+   * 3. Remove coordinator labels: `bd update <id> --remove-label
+   *    ce-beads:worker-finished` (and ce-beads:blocked, etc. — every
+   *    ce-beads:* label this run added).
+   * 4. Clear coordinator metadata: `bd update <id> --metadata
+   *    ce_beads_run_state= --metadata ce_beads_blocker_reason=` (clear
+   *    every ce_beads_* key this run set).
+   * 5. Read back the task to confirm the mutation applied.
+   * 6. Partial failure: if any single task's mutation fails, record it as
+   *    PARTIAL_APPLY, continue to the next task. At the end, if any
+   *    PARTIAL_APPLY occurred, the run is marked "failed" (not
+   *    "abandoned") and the outcome includes PARTIAL_APPLY diagnostics.
+   *    The human can retry abandon or reap.
+   * 7. Only tasks actually claimed by THIS run are restored — verified by
+   *    the assignee read-back in step 1.
+   *
+   * After all tasks processed: mark run-state "abandoned". Does NOT close
+   * or delete Beads tasks. Does NOT delete worktrees or branches (use reap
+   * for that). Requires preview→apply approval (same token pattern as reap).
    */
   abandon(runId: string, opts?: { applyToken?: string }): Promise<ProtocolEnvelope>;
 }
@@ -851,31 +915,49 @@ and the 6-state machine applied):
    finished_at, report integration SHA); else outcome blocked (nothing
    ready, nothing in flight, units remain — dependency wedge).
 2b. RETRY RECOVERY (only when invoked with `resume --retry`): scan
-   run-state units for any in state "blocked" (or blocked-equivalent
-   with a persisted last_successful_state). For each blocked unit:
-     i.   If resume --retry, transition the unit back to its
-          last_successful_state (recovering the last durable point).
-          Persist the new state. Then re-enter the loop at the step
-          appropriate for that state:
-            · last_successful_state == "captured" or "merged" or
-              "verified" → resume INTEGRATE (step 5) at the matching
-              sub-step (5b CAPTURE, 5e MERGE, 5f VERIFY-post-merge
-              respectively).
-            · last_successful_state == "worker_finished" → resume
-              INTEGRATE at 5a/5b.
-            · last_successful_state == "claimed" → re-attempt claim.
-              `bd claim` is idempotent if the same coordinator already
-              holds the claim, so this is safe; otherwise the existing
-              error path applies.
-     ii.  If last_successful_state is null AND the unit is blocked at
-          the "claimed" point, re-attempt claim (idempotent as above).
-     iii. If last_successful_state is null AND the unit is blocked
-          with no recoverable prior state, the unit has no safe
-          recovery point: leave it blocked, emit a diagnostic naming
-          the unit, and continue (do NOT silently skip it — the user
-          must decide).
+   run-state units for any in state "blocked". For each blocked unit:
+   NOTE: a unit blocked because report.status was "blocked" or "failed"
+   must NOT be retried via capture — the worker produced no capturable
+   work. Retry for these units means re-launching the worker (go back to
+   step 4 CLAIM with the same unit — re-claim is idempotent, workspace
+   is recreated fresh). Check last_successful_state:
+     i.   last_successful_state == "claimed" → the worker was never
+          launched or died before finishing. Re-attempt claim (idempotent
+          if same coordinator), then go to step 4d (createWorkspace) to
+          re-launch the worker. Do NOT reuse a stale workspace.
+     ii.  last_successful_state == "worker_finished" → the worker
+          completed but was blocked at CAPTURE (changed_files validation
+          or report.status != "complete"). If report.status was "blocked"
+          or "failed", do NOT retry capture — re-launch the worker (step
+          4d) instead. If report.status was "complete" but capture
+          failed, retry from step 5b CAPTURE.
+     iii. last_successful_state == "captured" → capture succeeded but
+          pre-merge verification failed. Do NOT re-capture. Resume at
+          step 5d VERIFY (pre-merge) — re-run the unit's
+          verification_commands. If they pass now (e.g. a flaky test),
+          proceed to 5e MERGE.
+     iv.  last_successful_state == "merged" → merge succeeded but
+          post-merge verification failed. Do NOT re-merge. Resume at
+          step 5f VERIFY (post-merge) — re-run verification_commands in
+          the integration worktree. If they pass, proceed to 5g CLOSE.
+     v.   last_successful_state == "verified" → verification passed
+          but close failed (bd error). Reconcile: read back Beads task
+          status via `bd show <id> --json`. If already closed (close
+          succeeded but state wasn't saved), advance to closed. If still
+          open, re-attempt step 5g CLOSE.
+     vi.  Merge-conflict retry: if blocked at MERGE due to a conflict,
+          --retry does NOT auto-resolve. The human must resolve the
+          conflict or abort. Retry refuses with RUN_ACTIVE (the merge
+          is left for human inspection). Use `run abandon` to release
+          the Beads task if abandoning the merge.
+     vii. last_successful_state is null AND no recoverable prior state:
+          leave blocked, emit a diagnostic naming the unit. The user
+          must decide (abandon or manually intervene).
    When no blocked unit has a recoverable last_successful_state, this
    step is a no-op. (FIX 1.)
+   NOTE: in the serial MVP, a blocked run STOPS — the loop does not
+   continue to other units while one is blocked. R6: "a blocked run
+   stops." --retry is the explicit way to re-attempt the blocked unit.
 3. If no inFlight and readyTasks empty → all closed? verify roster:
 4. CLAIM (per-mutation persist; packet built AFTER workspace exists):
    a. **Order by CE plan, not by bd (FIX 5):** sort readyTasks by the
@@ -883,8 +965,14 @@ and the 6-state machine applied):
       first → map to its U-ID via metadata ce_unit_id. (bd's incidental
       ready ordering is NOT authoritative for serial execution; the
       plan's dependency order is.)
-   b. client.update(id, { claim: true }); persist state "claimed",
-      claimed_at.
+   b. **Atomic claim with run_id:** client.update(id, {
+        claim: true,
+        setMetadata: { ce_beads_run_id: run.run_id }
+      }); This atomically claims the task AND attaches the run_id so
+      that even if the coordinator crashes before saving run-state,
+      a subsequent `run start` can detect the orphaned claim via
+      `bd list --metadata ce_beads_run_id=<run_id>` and refuse
+      (RUN_ACTIVE). Persist state "claimed", claimed_at in run-state.
    c. **P0-1:** forkSha = git rev-parse HEAD in the integration worktree
       (NOT run.base_sha). Persist forkSha as RunUnitRecord.worker_base_sha.
       run-state save after this external mutation (bd write).
@@ -968,7 +1056,7 @@ and the 6-state machine applied):
             ["ce-beads:blocked"] }); run-state status "failed";
             do NOT capture, do NOT merge, do NOT close. Return
             outcome failed with WORKER_FAILED. Worktree preserved.
-      - timeout|died → runtime.cleanup(handle, { destructive: false })
+- timeout|died → runtime.cleanup(handle, { pane: "close", worktree: "preserve", branch: "preserve" })
         (PRESERVE the worktree for inspection, P1-5); client.update(id,
         { setMetadata: { ce_beads_run_state: "blocked" }, addLabel:
         ["ce-beads:blocked"] }); state → "blocked"; run-state status
@@ -997,12 +1085,21 @@ and the 6-state machine applied):
                `git -C <unit-worktree> status --porcelain=v1 -z`
              The `-z` flag uses NUL separators and avoids quoting
              issues with spaces / unicode in filenames. For each
-             record, drop the leading XY status field (first two
-             bytes) and any trailing rename arrow (` -> `), then
-             resolve the path relative to the worktree root. Filter
-             out any path under `.ce-beads-worker/` (these are
-             artifacts; not part of the worker's deliverable). The
-             remaining set is `actualSet`.
+             record, the XY status field (first two bytes) indicates
+             the change type. **For this MVP, REJECT renames and
+             copies outright:** if XY starts with `R` (rename) or
+             `C` (copy), the record uses a NUL-delimited format with
+             two paths (source and destination) — there is no textual
+             ` -> ` separator in `-z` output. Rather than parse the
+             two-path rename format, mark the unit blocked with
+             CHANGED_FILES_INVALID ("renames/copies not supported in
+             serial MVP") and preserve the worktree for human
+             inspection. This avoids incorrect path extraction.
+             For non-rename records (XY is not R or C): drop the XY
+             field (first two bytes) and the following space, then
+             resolve the remaining path relative to the worktree root.
+             Filter out any path under `.ce-beads-worker/` (artifacts).
+             The remaining set is `actualSet`.
         iv.  Compute the two diffs required for EQUALITY:
                · reportedOnly = validatedSet − actualSet
                  (paths the worker declared but did NOT actually
@@ -1055,7 +1152,7 @@ and the 6-state machine applied):
       client.close(beads_id); persist integrated_sha = git rev-parse HEAD
       in the integration worktree; state → "closed"; run-state save
       (FIX 2 — last durable mutation before pane cleanup).
-      runtime.cleanup(handle, { destructive: true }) (worker branch
+      runtime.cleanup(handle, { pane: "close", worktree: "remove", branch: "remove" }) (worker branch
       merged, worktree safe to remove).
 6. Return per --once semantics; otherwise loop.
 ```
@@ -1232,23 +1329,28 @@ export type RunOutcome =
   | "in_progress"           // --once: unit claimed / worker launched or waiting
   | "awaiting_integration"  // --once: worker finished, integration pending
   | "completed"             // all units integrated + closed
-  | "blocked"               // unit blocked (verification/report/worker); loop stopped
+  | "blocked"               // unit blocked (verification/report/worker); loop STOPPED (serial MVP: no skip)
   | "failed"                // infrastructure failure; run-state intact; resumable
   | "reaped"                // run reap completed (apply-token matched)
-  | "preview"               // run reap without --apply: cleanup plan + run-state fingerprint, zero mutations
-  | "not_found"             // run status/resume/reap: unknown run-id
-  | "refused";              // precondition refusal (NOT_BOUND, RUN_ACTIVE, LOCK_BUSY)
+  | "abandoned"             // run abandon completed (Beads tasks released, apply-token matched)
+  | "preview"               // run reap/abandon without --apply: cleanup/release plan + fingerprint, zero mutations
+  | "not_found"             // run status/resume/reap/abandon: unknown run-id
+  | "refused";              // precondition refusal (NOT_BOUND, RUN_ACTIVE, LOCK_BUSY, TOKEN_MISMATCH)
 
 export type Outcome =
   | DoctorOutcome | BindOutcome | StatusOutcome | SyncOutcome
   | PacketOutcome | RunOutcome;
 ```
-
-### Reap preview/apply payload
+### Reap/abandon preview/apply payload
 
 ```ts
-// Reap preview/apply payload (reap returns "preview" without --apply,
-// "reaped" with a matching token — same pattern as bind/sync).
+// Reap and abandon both return "preview" without --apply, and "reaped" /
+// "abandoned" with a matching token — same pattern as bind/sync.
+// The token is SHA-256 over a canonical payload that includes the subcommand
+// (reap|abandon), the run-state fingerprint, the live target fingerprint
+// (current Beads task states + git branch HEADs), the force mode, and the
+// ordered operations list. This binds the approval to the exact state at
+// preview time — any drift invalidates the token.
 
 export interface ReapCleanupEntry {
   unit_id: string;
@@ -1256,16 +1358,37 @@ export interface ReapCleanupEntry {
   worker_pane_id: string | null;
   worktree_path: string | null;
   worker_branch: string | null;
-  /** "preserve" (default) or "remove" (with --force). */
-  action: "preserve" | "remove";
+  /** Separate actions for pane, worktree, branch (reap preview fix). */
+  pane: "close" | "preserve";
+  worktree: "preserve" | "remove";
+  branch: "preserve" | "remove";
+}
+
+export interface AbandonReleaseEntry {
+  unit_id: string;
+  beads_id: string;
+  /** Current assignee in Beads (must match this run's coordinator; refuse if changed). */
+  current_assignee: string | null;
+  /** Labels to remove (ce-beads:* labels added by this run). */
+  labels_to_remove: string[];
+  /** Metadata keys to clear (ce_beads_run_state, ce_beads_blocker_reason, etc.). */
+  metadata_to_clear: string[];
 }
 
 export interface ReapPreviewData {
   run_id: string;
   run_status: RunStatus;
   cleanup_entries: ReapCleanupEntry[];
-  integration_worktree: { path: string; action: "preserve" | "remove" };
-  /** Fingerprint = SHA-256 over the canonical cleanup set. */
+  integration_worktree: { path: string; worktree: "preserve" | "remove"; branch: "preserve" | "remove" };
+  /** SHA-256 over canonical (subcommand, run-state-fingerprint, live-fingerprint, force, operations). */
+  approval_token: string;
+}
+
+export interface AbandonPreviewData {
+  run_id: string;
+  run_status: RunStatus;
+  release_entries: AbandonReleaseEntry[];
+  /** SHA-256 over canonical (subcommand, run-state-fingerprint, live-fingerprint, operations). */
   approval_token: string;
 }
 ```
@@ -1275,17 +1398,20 @@ Diagnostic codes (append to `DiagnosticCode`):
 ```ts
   | "UNIT_NOT_FOUND"            // packet: no such U-ID in the plan
   | "NOT_BOUND"                 // run start: plan has no binding in Beads
-  | "RUN_ACTIVE"                // run start/reap: a non-terminal run exists (includes blocked, P1-3)
-  | "RUN_NOT_FOUND"             // status/resume/reap: unknown run-id
+  | "RUN_ACTIVE"                // run start/reap: a non-terminal run exists (includes blocked + failed-with-unfinished, P1-3)
+  | "RUN_NOT_FOUND"             // status/resume/reap/abandon: unknown run-id
   | "RUN_STATE_CORRUPT"         // run-state file unparsable / wrong schema_version
   | "WORKER_FAILED"             // worker died / timed out / empty diff
   | "WORKER_REPORT_INVALID"     // result file present but failed validation
+  | "WORKER_BLOCKED"            // worker report status was "blocked"
   | "VERIFICATION_FAILED"       // pre-merge unit verification non-zero
   | "INTEGRATION_FAILED"        // merge conflict or post-merge verification non-zero
-  | "RUNTIME_FAILURE";          // Herdr CLI errors, pane lost, API-key error
-  | "PLAN_DIGEST_DRIFT"        // resume: plan file edited since run start
-  | "WORKER_BLOCKED"           // worker report status was "blocked"
-  | "CHANGED_FILES_INVALID"    // changed_files failed validation (escaping, artifacts, unreported)
+  | "CHANGED_FILES_INVALID"     // changed_files failed validation (escaping, artifacts, unreported, unreported-mod)
+  | "RUNTIME_FAILURE"           // Herdr CLI errors, pane lost, API-key error
+  | "PLAN_DIGEST_DRIFT"         // resume: plan file edited since run start
+  | "TOKEN_MISMATCH"            // reap/abandon/sync apply: token does not match preview
+  | "EXTERNAL_CHANGE"           // abandon: Beads task assignee changed since preview
+  | "PARTIAL_APPLY";            // abandon: some mutations applied, some failed
 ```
 
 `exitCodeFor` additions (insert in this order, before the generic tail; the
@@ -1301,14 +1427,18 @@ existing function is a sequence of early returns — match that style):
   if (diagnostics.some((d) => d.code === "RUN_STATE_CORRUPT")) return ExitCode.CONFLICT;
   if (diagnostics.some((d) => d.code === "PLAN_DIGEST_DRIFT")) return ExitCode.CONFLICT;
   if (diagnostics.some((d) => d.code === "CHANGED_FILES_INVALID")) return ExitCode.CONFLICT;
+  if (diagnostics.some((d) => d.code === "TOKEN_MISMATCH")) return ExitCode.CONFLICT;
+  if (diagnostics.some((d) => d.code === "EXTERNAL_CHANGE")) return ExitCode.CONFLICT;
   // WORKER_BLOCKED maps to "blocked" outcome → already CONFLICT via existing branch
+  // PARTIAL_APPLY maps to ExitCode.PARTIAL
 
   // Outcome mappings (with the existing outcome checks, after "preview"/"partial").
   if (outcome === "failed") return ExitCode.PARTIAL;      // resumable, state persisted
   if (outcome === "not_found") return ExitCode.USAGE;
+  if (diagnostics.some((d) => d.code === "PARTIAL_APPLY")) return ExitCode.PARTIAL;
   // "blocked" and "refused" already map to CONFLICT via the existing branch.
-  // "packet_built" | "in_progress" | "awaiting_integration" | "completed" | "reaped"
-  // fall through to SUCCESS.
+  // "packet_built" | "in_progress" | "awaiting_integration" | "completed"
+  // | "reaped" | "abandoned" | "preview" fall through to SUCCESS.
 ```
 
 ---
@@ -1329,7 +1459,8 @@ export interface CliArgs {
   unitId: string | undefined;     // packet <plan> <U-ID>
   runSub: "start" | "status" | "resume" | "reap" | "abandon" | undefined;
   once: boolean;                  // run start/resume --once
-  force: boolean;                 // run reap --force ONLY (R11: rejected elsewhere)
+  retry: boolean;                 // run resume --retry: re-enter blocked unit from last_successful_state
+  force: boolean;                // run reap --force ONLY (R11: rejected elsewhere)
 }
 ```
 
@@ -1343,10 +1474,12 @@ Parsing rules (replace the current allowlist + positional loop):
   runSub; args[2] (positional) → planPath slot (plan path for start; run-id
   for status/resume/reap/abandon; optional for status — omitted means latest
   run). Unknown/missing sub → usage.
-- Flags: --json, --apply <token>, --help/-h as today; add --once and
-  --force. **R11: --force is rejected (usage, exit 2) unless
+- Flags: --json, --apply <token>, --help/-h as today; add --once,
+  --retry, and --force. **R11: --force is rejected (usage, exit 2) unless
   action === "run" && runSub === "reap".** --once is rejected unless
   action === "run" && (runSub === "start" || runSub === "resume").
+  **--retry is rejected (usage, exit 2) unless action === "run" &&
+  runSub === "resume".** --retry is passed as opts.retry into RunEngine.resume.
 ```
 
 `usageMessage()` additions (match existing column style):
@@ -1357,10 +1490,8 @@ Parsing rules (replace the current allowlist + positional loop):
   run status [run-id]   Read-only run snapshot (latest run when omitted)
   run resume <run-id>   Re-attach to an in-flight worker / resume the loop
   run reap <run-id>     Clean up orphaned worktrees/panes (never touches Beads)
-  run abandon <run-id>  Release coordinator-owned Beads tasks for a blocked/failed run
-
-Run flags:
   --once               Execute a single loop iteration (start/resume only)
+  --retry              Re-enter a blocked unit from its last_successful_state (resume only)
   --force              Reap even when the run-state says in_progress (reap only)
 ```
 
@@ -1437,7 +1568,7 @@ fixtures under `tests/fixtures/`. New helpers:
 | T8 | run-state.test.ts: R10 location | run state lives under `$GIT_DIR/ce-beads/`, not repo root; consumer repo working tree stays clean | isolated GIT_DIR |
 | T9 | worker-report.test.ts: valid reports accepted | valid-complete + valid-blocked pass; blockers non-empty iff blocked | worker-reports/valid-*.json |
 | T10 | worker-report.test.ts: invalid reports rejected | missing fields, bad status enum, non-JSON, wrong schema_version all → ok:false | worker-reports/invalid-*.json |
-| T11 | plan-parser.test.ts: Verification Contract parsing | R8: parses the Verification Contract table into typed entries; maps U-IDs to commands; tolerates empty table | 02-linear-three-unit.md, 17-work-failing-verification.md |
+| T11 | plan-parser.test.ts: Verification Contract + requirement defs + KTDs | R8: parses VC table into typed entries; maps U-IDs to commands; tolerates empty table. Also parses requirement definitions (R-ID → text) and KTD excerpts (KTD-ID → text); selects per-unit KTDs by matching unit requirement IDs; verifies packet includes `requirement_defs` and `ktd_excerpts` with correct content | 02-linear-three-unit.md, 17-work-failing-verification.md |
 | T12 | orchestrator.test.ts: full serial loop end-to-end | MockRuntime; 3-unit linear plan: claim U1 → worker → capture → verify → merge → verify → close; then U2, U3; final outcome completed; integration branch contains all units' files; each task's `closed_at` set only AFTER its `merge_sha` recorded | 02-linear-three-unit.md + setupGitRepo + MockRuntime |
 | T13 | orchestrator.test.ts: **integrate-before-close invariant** | Drive with --once; after worker-finished, task is `in_progress` with `ce-beads:worker-finished` label and NOT closed; `bd ready` does NOT yet list U2; only after the full integrate cycle does U1 close and U2 become ready. Assert close-time ordering: no `close` call occurs before merge + verification in a spy-wrapped client. Grep-verifiable single-close-call-site (§8.5). | 02-linear-three-unit.md |
 | T14 | orchestrator.test.ts: **worker-base-sha freshness (P0-1)** | U2's worker_base_sha equals the integration worktree HEAD AFTER U1 was merged, NOT run.base_sha. U2's worktree contains U1's implementation (use fixture 18 where U2 imports U1's code). Verify by reading U1's file from U2's worktree. | 18-work-u2-depends-on-u1-impl.md |
@@ -1455,7 +1586,16 @@ fixtures under `tests/fixtures/`. New helpers:
 | T23d | orchestrator.test.ts: reap token mismatch | refused, zero mutations | 02-linear-three-unit.md |
 | T23e | orchestrator.test.ts: path escaping in changed_files | absolute paths, ../escaping, .ce-beads-worker/**, and plan file → CHANGED_FILES_INVALID, unit blocked | 02-linear-three-unit.md |
 | T23f | orchestrator.test.ts: unreported modifications | git status has files NOT in changed_files → CHANGED_FILES_INVALID, unit blocked | 02-linear-three-unit.md |
-| T24 | cli.test.ts (extend): arg parsing | packet/run parse branches, --once/--force, usage gates (missing unit-id, bad runSub) → usage + exit 2; **--force outside run reap rejected (R11)** | — (pure parse) |
+| T23g | orchestrator.test.ts: retry routing — captured → verify | Block unit at captured; `resume --retry`; engine resumes at 5d VERIFY (pre-merge), NOT 5b CAPTURE | 02-linear-three-unit.md |
+| T23h | orchestrator.test.ts: retry routing — merged → verify-post | Block unit at merged; `resume --retry`; engine resumes at 5f VERIFY (post-merge), NOT 5e MERGE | 02-linear-three-unit.md |
+| T23i | orchestrator.test.ts: retry routing — verified → close reconcile | Block unit at verified; `resume --retry`; engine reads back Beads; if already closed, advances; if open, re-attempts 5g CLOSE | 02-linear-three-unit.md |
+| T23j | orchestrator.test.ts: retry routing — blocked report → re-launch worker | Unit blocked with report.status="blocked"; `resume --retry`; engine re-launches worker (step 4d), NOT capture | 02-linear-three-unit.md |
+| T23k | orchestrator.test.ts: merge-conflict retry refuses | Unit blocked at MERGE due to conflict; `resume --retry` refuses (human must resolve); run stays blocked | 02-linear-three-unit.md |
+| T23l | orchestrator.test.ts: abandon preview/apply | `run abandon` without --apply returns preview with AbandonReleaseEntry[]; with matching token releases tasks (bd assign "", remove labels/metadata); with wrong token → TOKEN_MISMATCH, zero mutations | 02-linear-three-unit.md |
+| T23m | orchestrator.test.ts: abandon external change | Between preview and apply, change the Beads task assignee manually; apply → EXTERNAL_CHANGE, skip that task | 02-linear-three-unit.md |
+| T23n | orchestrator.test.ts: abandon partial failure | One task's `bd assign` fails; others succeed; outcome includes PARTIAL_APPLY; run marked "failed" not "abandoned" | 02-linear-three-unit.md |
+| T23o | orchestrator.test.ts: prompt-dispatch recovery | Crash after startWorkerPhase1 but before Phase2; resume finds pane by label, re-invokes Phase2; no duplicate prompt if promptLifecycle="sent" | 02-linear-three-unit.md |
+| T24 | cli.test.ts (extend): arg parsing | packet/run parse branches, --once/--force/--retry, usage gates (missing unit-id, bad runSub) → usage + exit 2; **--force outside run reap rejected (R11)**; **--retry outside run resume rejected** | — (pure parse) |
 | T25 | packaging.test.ts (extend): new skill layout + agent file at `agents/` (R9) | `skills/ce-beads-work/SKILL.md` frontmatter parses; `agents/ce-beads-unit.md` exists at package root and is included in `bun pm pack --dry-run` output; `package.json` `files` includes `"agents/"`; agent-file tools list equals `HERDR_WORKER_TOOLS` and contains no `task` | repo files |
 | T26 | herdr-runtime.test.ts (create): **HerdrRuntime argv construction (P0-4)** | HerdrRuntime constructs correct omp argv: `--append-system-prompt` with path using NO `@` prefix; includes `--profile`, `--model`, `--tools`, `--no-session`. Assert argv array matches expected structure, or run with a fake executable (temp script that echoes its argv) to verify it is well-formed. Does NOT launch real OMP. Real prompt-loading verification is manual acceptance (§7). | — (pure assert) |
 | T27 | regression: existing suites | `bun run verify` — bind/status/sync/doctor/plan-parser/graph-builder/beads-client/packaging/docs all green | existing 16 fixtures |
@@ -1464,8 +1604,11 @@ MockRuntime contract (T12–T22): constructed with a script
 `Record<U-ID, { writeFiles: Record<path,string>; report: WorkerReport |
 "malformed" | "die" }>`. `createWorkspace` does a REAL `git worktree add`
 (against the temp repo, from the engine-supplied forkSha — P0-1),
-`startWorker` applies `writeFiles` to the worktree and writes the result
-file (atomically), returns a handle. `wait` returns per script.
+creates `.ce-beads-worker/` dir, returns Workspace.
+`startWorkerPhase1` returns a handle with promptLifecycle="not_sent"
+(no real pane created — paneId="mock"). `startWorkerPhase2` applies
+`writeFiles` to the worktree and writes the result file (atomically),
+sets promptLifecycle="sent". `wait` returns per script.
 `inspect`/`cleanup` are spy-recorded. **The MockRuntime does NOT commit**
 (P1-4/P1-5) — the engine's CAPTURE step does the commit, identical to the
 production path. This ensures CI exercises the real commit/integration
@@ -1525,7 +1668,7 @@ bd init --non-interactive --init-if-missing --skip-agents --skip-hooks --stealth
 | O11 | When all units integrate: outcome `completed` with the integration-branch SHA; coordinator STOPS with a human notice; no ce-simplify/review/PR/push; `git branch` shows `main` untouched and `ce-beads/<slug>-<run-id>` holding the work | CLI envelope; `git log main..HEAD` on the integration branch |
 | O12 | Plans untouched: the fixture plan file is byte-identical before/after (SD7) | `git status` — no modification to tests/fixtures/plans/ |
 | O13 | **R10:** No `.ce-beads/` directory in the consumer repo working tree (run state lives under `$GIT_DIR/ce-beads/`) | `ls .ce-beads 2>/dev/null` → not found |
-| O14 | `herdr pane split` JSON field: confirm `result.pane_id` (or `result.pane?.pane_id`) field name | `herdr pane split --current --direction right --no-focus --json` in a scratch pane |
+| O14 | `herdr pane split` JSON field: confirm `result.pane_id` (or `result.pane?.pane_id`) field name | `herdr pane split --current --direction right --no-focus` (observe JSON output); then `herdr pane close <pane_id>` to clean up the scratch pane |
 | O15 | `omp --tools` accepts `lsp` and `ast_grep` (or both lists drop them together per the single-source rule) | `omp --profile chinese --model @smol --no-session --tools read,grep,glob,bash,edit,write,lsp,ast_grep --append-system-prompt /dev/null -p "ok"` in a scratch dir |
 
 ### Failure-path spot check (optional but recommended)
@@ -1552,9 +1695,10 @@ The milestone is done when ALL of the following hold:
    the full pre-existing MVP suite with zero regressions (T26).
 3. The manual acceptance test in §7 passes every required observation
    O1–O13.
-4. The five CLI actions behave exactly as specified: `packet` read-only;
-   `run start/status/resume/reap` with the outcome/exit-code mapping in §4;
-   `run reap` never mutates Beads; `--force` rejected outside reap (R11).
+4. The six CLI actions behave exactly as specified: `packet` read-only;
+   `run start/status/resume/reap/abandon` with the outcome/exit-code mapping
+   in §4; `run reap` never mutates Beads; `run abandon` releases Beads state
+   only; `--force` rejected outside reap; `--retry` rejected outside resume (R11).
 5. Integrate-before-close holds in the only place it can be violated: no
    code path calls `BeadsClient.close` except the orchestrator's
    post-merge, post-verification step (grep-verifiable:
