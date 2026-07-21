@@ -22,14 +22,11 @@ omp --version   # omp/17.0.5
 
 ## Install as an OMP plugin
 
-**GitHub** (after the repository is published):
+**GitHub**:
 
 ```bash
-omp plugin install github:OWNER/ce-beads#v0.1.0
+omp plugin install github:sh1ny/ce-beads#v0.1.0
 ```
-
-`OWNER` is a placeholder; the real owner and URL are filled in when you create
-the GitHub repository.
 
 **Local development from a checkout:**
 
@@ -58,10 +55,7 @@ omp plugin doctor                     # health checks
 omp plugin doctor --json
 
 # update: re-install with a new git ref (moves the pin)
-omp plugin install github:OWNER/ce-beads#<new-ref>
-
-# linked checkouts need no update — source edits flow through the symlink
-omp plugin uninstall ce-beads
+omp plugin install github:sh1ny/ce-beads#<new-ref>
 ```
 
 ## Skill vs standalone CLI
@@ -163,8 +157,16 @@ The package ships exactly `skills/`, `README.md`, `UPSTREAMS.lock.json` (the
 npm `files` allowlist) plus `package.json`; `tests/`, `docs/`, `upstream/`,
 `.beads/` are excluded. Upstream checkouts are **provenance only**.
 
-**Marketplace installation is not yet provided.** Pre-publication decisions
-still open: public license and GitHub repository metadata.
+Marketplace installation is not yet provided (direct Git/npm install only).
+
+## License
+
+Dual-licensed under either of:
+
+- MIT License ([LICENSE-MIT](LICENSE-MIT))
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+
+at your option.
 
 ## Clean-profile acceptance test
 
@@ -185,6 +187,6 @@ plugin** from an unrelated consumer project.
 See `UPSTREAMS.lock.json` for:
 - `compound-engineering-plugin` commit `74ba763608d9f00172ca0b4b52e433934642dd0b`
 - `beads` commit `1823f47ae42c93cb753536dfc49fa2337ace8eb1`
-- Tested: `bd` 1.1.0, Bun 1.3.14, OMP 17.0.5, Node 24.18.0
+- Tested: `bd` 1.1.0, Bun 1.3.14, OMP 17.0.6, Node 24.18.0
 
 The upstream checkouts (`upstream/compound-engineering-plugin`, `upstream/beads`) are **implementation provenance** — read-only references used during development to target the CE plan schema and the `bd` CLI surface. They are gitignored and **not required at runtime**: the skill invokes the `bd` binary from PATH and never reads the upstream trees. `UPSTREAMS.lock.json` intentionally omits machine-specific paths (binary locations, local DB/workspace state).
