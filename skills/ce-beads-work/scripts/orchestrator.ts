@@ -5,7 +5,7 @@
 
 import { existsSync } from "node:fs";
 import { mkdir, rm, writeFile, readFile } from "node:fs/promises";
-import { join } from "node:path";
+import { join, sep, basename } from "node:path";
 import type { CePlan, CeUnit, VerificationEntry } from "../../ce-beads/scripts/plan-parser.ts";
 import { parsePlan, PlanParseError } from "../../ce-beads/scripts/plan-parser.ts";
 import { BeadsClient, BdError } from "../../ce-beads/scripts/beads-client.ts";
@@ -356,8 +356,9 @@ export class RunEngine {
       }
     }
 
-    // Mark run failed.
-    state.status = "failed";
+    // Mark run reaped — a terminal status that findActiveRunForPlan
+    // does not consider active (unlike "failed" with unfinished units).
+    state.status = "reaped";
     state.finished_at = new Date().toISOString();
     saveRunState(state, this.repoRoot);
 
@@ -701,6 +702,17 @@ export class RunEngine {
 
     if (waitResult.kind === "completed") {
       const report = waitResult.report;
+      // Validate report identity: the report's u_id must match the unit
+      // being processed. A stale or wrong-unit result file must not
+      // advance the current unit's state (ce-beads-thread-24).
+      if (report.u_id !== unitId) {
+        state.status = "blocked";
+        return this.blockUnit(state, client, record, unitId, "claimed", {
+          code: "WORKER_REPORT_INVALID",
+          severity: "blocking",
+          message: `Worker report u_id "${report.u_id}" does not match unit "${unitId}". Rejecting stale/wrong-unit result.`,
+        });
+      }
       record.result = report;
       if (report.status === "complete") {
         record.state = "worker_finished";
@@ -771,9 +783,9 @@ export class RunEngine {
     if (record.state === "worker_finished") {
       // 5b. CAPTURE: validate changed_files + commit.
       const report = record.result!;
-      const validatedSet = this.validateChangedFiles(report.changed_files, record.worktree_path!);
+      const validatedSet = this.validateChangedFiles(report.changed_files, record.worktree_path!, plan.path);
       if (!validatedSet) {
-        return this.blockUnit(state, client, record, unitId, "captured", {
+        return this.blockUnit(state, client, record, unitId, "worker_finished", {
           code: "CHANGED_FILES_INVALID",
           severity: "blocking",
           message: `Changed files validation failed for ${unitId}.`,
@@ -784,7 +796,7 @@ export class RunEngine {
       const statusRaw = await statusPorcelain(record.worktree_path!);
       const actualSet = this.parseActualFiles(statusRaw);
       if (!actualSet.ok) {
-        return this.blockUnit(state, client, record, unitId, "captured", {
+        return this.blockUnit(state, client, record, unitId, "worker_finished", {
           code: "CHANGED_FILES_INVALID",
           severity: "blocking",
           message: actualSet.error,
@@ -800,7 +812,7 @@ export class RunEngine {
           parts.push(`undeclared modification: ${actualOnly.sort().join(", ")}`);
         if (reportedOnly.length > 0)
           parts.push(`declared but not modified: ${reportedOnly.sort().join(", ")}`);
-        return this.blockUnit(state, client, record, unitId, "captured", {
+        return this.blockUnit(state, client, record, unitId, "worker_finished", {
           code: "CHANGED_FILES_INVALID",
           severity: "blocking",
           message: `Changed files mismatch for ${unitId}: ${parts.join("; ")}`,
@@ -817,7 +829,7 @@ export class RunEngine {
         record.worker_commit_sha = sha;
       } else {
         // Empty diff + status complete → WORKER_FAILED.
-        return this.blockUnit(state, client, record, unitId, "captured", {
+        return this.blockUnit(state, client, record, unitId, "worker_finished", {
           code: "WORKER_FAILED",
           severity: "blocking",
           message: `Worker reported complete but no changes for ${unitId}.`,
@@ -981,17 +993,22 @@ export class RunEngine {
   private validateChangedFiles(
     changedFiles: string[],
     worktreePath: string,
+    planPath: string,
   ): string[] | null {
     const validated: string[] = [];
+    // Normalize the plan path for comparison (repo-relative, forward slashes).
+    const normalizedPlanPath = planPath.replace(/\\/g, "/").replace(/^\.\//, "");
     for (const p of changedFiles) {
       // Must be repo-relative (no leading /).
       if (p.startsWith("/")) return null;
       // Must not escape via ..
       const resolved = join(worktreePath, p);
-      if (!resolved.startsWith(worktreePath)) return null;
+      if (!resolved.startsWith(worktreePath + sep)) return null;
       // Must not be under .ce-beads-worker/.
       if (p.startsWith(".ce-beads-worker/")) return null;
-      // Must not be the plan file.
+      // Must not be the plan file — the CE plan is immutable during a run.
+      const normalizedP = p.replace(/\\/g, "/");
+      if (normalizedP === normalizedPlanPath) return null;
       validated.push(p);
     }
     return validated;

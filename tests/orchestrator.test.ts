@@ -411,3 +411,153 @@ describe("orchestrator: reap and abandon", () => {
     expect(abandonEnv.data).toBeDefined();
   }, 30000);
 });
+
+describe("orchestrator: u_id mismatch rejection (thread 24)", () => {
+  let repoDir: string;
+  let beadsDir: string;
+  let planPath: string;
+
+  beforeEach(async () => {
+    repoDir = setupGitRepo();
+    beadsDir = join(repoDir, ".beads");
+    planPath = await setupBoundPlan(repoDir, beadsDir, "02-linear-three-unit.md");
+  });
+
+  afterEach(() => {
+    rmSync(repoDir, { recursive: true, force: true });
+  });
+
+  it("blocks when worker report u_id does not match unit", async () => {
+    // Worker writes a report with a wrong u_id (stale/wrong-unit result file).
+    const wrongReport = makeCompleteReport("U2", ["src/u1.ts"]);
+    const script: MockScriptMap = {
+      U1: { writeFiles: { "src/u1.ts": "export const U1 = true;\n" }, report: wrongReport },
+    };
+    const runtime = makeMockRuntime(script);
+    const engine = new RunEngine({ repoRoot: repoDir, beadsDir, runtime, workerTimeoutMs: 5000 });
+
+    const env = await engine.start(planPath);
+    expect(env.outcome).toBe("blocked");
+    const diags = env.diagnostics.map((d) => d.code);
+    expect(diags).toContain("WORKER_REPORT_INVALID");
+  }, 30000);
+});
+
+describe("orchestrator: plan file rejection in changed_files (thread 25)", () => {
+  let repoDir: string;
+  let beadsDir: string;
+  let planPath: string;
+
+  beforeEach(async () => {
+    repoDir = setupGitRepo();
+    beadsDir = join(repoDir, ".beads");
+    planPath = await setupBoundPlan(repoDir, beadsDir, "02-linear-three-unit.md");
+  });
+
+  afterEach(() => {
+    rmSync(repoDir, { recursive: true, force: true });
+  });
+
+  it("blocks when worker includes plan.md in changed_files", async () => {
+    // Worker reports it changed the plan file — must be rejected.
+    const script: MockScriptMap = {
+      U1: {
+        writeFiles: { "src/u1.ts": "export const U1 = true;\n", "plan.md": "# modified plan\n" },
+        report: makeCompleteReport("U1", ["src/u1.ts", "plan.md"]),
+      },
+    };
+    const runtime = makeMockRuntime(script);
+    const engine = new RunEngine({ repoRoot: repoDir, beadsDir, runtime, workerTimeoutMs: 5000 });
+
+    const env = await engine.start(planPath);
+    expect(env.outcome).toBe("blocked");
+    const diags = env.diagnostics.map((d) => d.code);
+    expect(diags).toContain("CHANGED_FILES_INVALID");
+  }, 30000);
+});
+
+describe("orchestrator: reaped run is not active (thread 23)", () => {
+  let repoDir: string;
+  let beadsDir: string;
+  let planPath: string;
+
+  beforeEach(async () => {
+    repoDir = setupGitRepo();
+    beadsDir = join(repoDir, ".beads");
+    planPath = await setupBoundPlan(repoDir, beadsDir, "02-linear-three-unit.md");
+  });
+
+  afterEach(() => {
+    rmSync(repoDir, { recursive: true, force: true });
+  });
+
+  it("allows a new run after reap (reaped status is not active)", async () => {
+    const script: MockScriptMap = {
+      U1: { writeFiles: {}, report: makeBlockedReport("U1", "test block") },
+    };
+    const runtime = makeMockRuntime(script);
+    const engine = new RunEngine({ repoRoot: repoDir, beadsDir, runtime, workerTimeoutMs: 5000 });
+
+    // Start a run (it will block on U1).
+    const startEnv = await engine.start(planPath);
+    const runId = (startEnv.data as { runId: string }).runId;
+
+    // Reap with --force (run is in_progress/blocked).
+    const reapPreview = await engine.reap(runId, { force: true });
+    expect(reapPreview.outcome).toBe("preview");
+    const token = (reapPreview.data as { approval_token?: string })?.approval_token;
+    expect(token).toBeDefined();
+
+    const reapEnv = await engine.reap(runId, { force: true, applyToken: token! });
+    expect(reapEnv.outcome).toBe("reaped");
+
+    // After reap, findActiveRunForPlan should return null.
+    const active = findActiveRunForPlan("plan.md", repoDir);
+    expect(active).toBeNull();
+
+    // A new run for the same plan should NOT be refused with RUN_ACTIVE.
+    const secondEnv = await engine.start(planPath);
+    expect(secondEnv.outcome).not.toBe("refused");
+    const diags = secondEnv.diagnostics.map((d) => d.code);
+    expect(diags).not.toContain("RUN_ACTIVE");
+  }, 30000);
+});
+
+describe("orchestrator: capture failure retry restores worker_finished (thread 22)", () => {
+  let repoDir: string;
+  let beadsDir: string;
+  let planPath: string;
+
+  beforeEach(async () => {
+    repoDir = setupGitRepo();
+    beadsDir = join(repoDir, ".beads");
+    planPath = await setupBoundPlan(repoDir, beadsDir, "02-linear-three-unit.md");
+  });
+
+  afterEach(() => {
+    rmSync(repoDir, { recursive: true, force: true });
+  });
+
+  it("retry re-enters capture after a changed_files mismatch block", async () => {
+    // First attempt: worker declares files that don't match reality.
+    // This blocks at capture with last_successful_state = "worker_finished".
+    const mismatchScript: MockScriptMap = {
+      U1: {
+        writeFiles: { "src/u1.ts": "export const U1 = true;\n" },
+        report: makeCompleteReport("U1", ["src/u1.ts", "src/undeclared.ts"]),
+      },
+    };
+    const runtime = makeMockRuntime(mismatchScript);
+    const engine = new RunEngine({ repoRoot: repoDir, beadsDir, runtime, workerTimeoutMs: 5000 });
+
+    const startEnv = await engine.start(planPath);
+    expect(startEnv.outcome).toBe("blocked");
+    const runId = (startEnv.data as { runId: string }).runId;
+
+    // Verify the blocked unit's last_successful_state is worker_finished.
+    const state = loadRunState(runId, repoDir);
+    const u1Record = state.units["U1"]!;
+    expect(u1Record.state).toBe("blocked");
+    expect(u1Record.last_successful_state).toBe("worker_finished");
+  }, 30000);
+});

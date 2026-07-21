@@ -23,7 +23,7 @@ import type { WorkerReport } from "./worker-report.ts";
 export const RUN_STATE_SCHEMA_VERSION = "ce-beads-run/1" as const;
 
 /** Lifecycle status of a coordinator run. */
-export type RunStatus = "in_progress" | "blocked" | "completed" | "failed" | "abandoned";
+export type RunStatus = "in_progress" | "blocked" | "completed" | "failed" | "abandoned" | "reaped";
 
 /**
  * Per-unit lifecycle. The coordinator persists each transition so resume can
@@ -112,6 +112,7 @@ const RUN_STATUS_VALUES = new Set<RunStatus>([
   "completed",
   "failed",
   "abandoned",
+  "reaped",
 ]);
 
 const UNIT_STATE_VALUES = new Set<UnitRunState>([
