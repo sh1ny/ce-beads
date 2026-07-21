@@ -7,6 +7,12 @@ import { handler } from "../skills/ce-beads-work/scripts/packet.ts";
 import type { CliArgs } from "../skills/ce-beads/scripts/cli.ts";
 import { BeadsClient } from "../skills/ce-beads/scripts/beads-client.ts";
 import { parsePlan } from "../skills/ce-beads/scripts/plan-parser.ts";
+import type { VerificationEntry } from "../skills/ce-beads/scripts/plan-parser.ts";
+import {
+  buildWorkerPacket,
+  planSlug,
+  PACKET_SCHEMA_VERSION,
+} from "../skills/ce-beads-work/scripts/worker-packet.ts";
 
 const FIXTURES = join(import.meta.dir, "fixtures", "plans");
 
@@ -224,5 +230,98 @@ describe("packet: malformed plan (T4)", () => {
 
     expect(env.ok).toBe(false);
     expect(env.diagnostics.some((d) => d.code === "PLAN_MALFORMED")).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// buildWorkerPacket + planSlug (worker-packet.ts) — unit-level coverage
+// ---------------------------------------------------------------------------
+
+describe("buildWorkerPacket", () => {
+  const REPO_ROOT = join(import.meta.dir, "..");
+  const FIXTURES = join(import.meta.dir, "fixtures", "plans");
+  const plan = parsePlan(join(FIXTURES, "02-linear-three-unit.md"), { repoRoot: REPO_ROOT });
+  const u1 = plan.units.find((u) => u.id === "U1")!;
+  const u2 = plan.units.find((u) => u.id === "U2")!;
+
+  it("standalone packet: schema_version, run_id=null, all run-context fields null", () => {
+    const packet = buildWorkerPacket(plan, u1, plan.verification_commands);
+
+    expect(packet.schema_version).toBe(PACKET_SCHEMA_VERSION);
+    expect(packet.schema_version).toBe("ce-beads-packet/1");
+    expect(packet.run_id).toBeNull();
+    expect(packet.beads_id).toBeNull();
+    expect(packet.base_sha).toBeNull();
+    expect(packet.branch).toBeNull();
+    expect(packet.worktree_path).toBeNull();
+    expect(packet.result_file).toBeNull();
+  });
+
+  it("live packet: opts set run-context fields, result_file derived from worktreePath", () => {
+    const packet = buildWorkerPacket(plan, u1, plan.verification_commands, {
+      runId: "run-abc",
+      beadsId: "bead-xyz",
+      baseSha: "abc123def456",
+      branch: "feat/my-unit",
+      worktreePath: "/tmp/worktrees/my-unit",
+    });
+
+    expect(packet.run_id).toBe("run-abc");
+    expect(packet.beads_id).toBe("bead-xyz");
+    expect(packet.base_sha).toBe("abc123def456");
+    expect(packet.branch).toBe("feat/my-unit");
+    expect(packet.worktree_path).toBe("/tmp/worktrees/my-unit");
+    expect(packet.result_file).toBe("/tmp/worktrees/my-unit/.ce-beads-worker/result.json");
+  });
+
+  it("PacketUnit has correct fields from CeUnit", () => {
+    const packet = buildWorkerPacket(plan, u1, plan.verification_commands);
+    const pu = packet.unit;
+
+    expect(pu.id).toBe("U1");
+    expect(pu.title).toBe("First unit");
+    expect(pu.goal).toBe("Be the root of the chain.");
+    expect(pu.requirements).toEqual(["R1"]);
+    expect(pu.dependencies).toEqual([]);
+    expect(pu.files).toEqual(["src/u1.ts"]);
+    expect(pu.approach).toBe("Implement unit one.");
+    expect(pu.patterns).toEqual(["Linear ordering."]);
+    expect(pu.test_scenarios).toEqual(["U1 is ready first."]);
+    expect(pu.verification).toEqual(["U1 parses."]);
+    expect(pu.execution_note).toBeUndefined();
+    expect(pu.technical_design).toBeUndefined();
+  });
+
+  it("verification_commands reflect the passed-in filtered list", () => {
+    const u1Cmds: VerificationEntry[] = [{ unit_id: "U1", command: "bun test" }];
+    const u2Cmds: VerificationEntry[] = [{ unit_id: "U2", command: "bun test:unit2" }];
+
+    const p1 = buildWorkerPacket(plan, u1, u1Cmds);
+    expect(p1.verification_commands).toHaveLength(1);
+    expect(p1.verification_commands[0]!.unit_id).toBe("U1");
+    expect(p1.verification_commands[0]!.command).toBe("bun test");
+
+    const p2 = buildWorkerPacket(plan, u2, u2Cmds);
+    expect(p2.verification_commands).toHaveLength(1);
+    expect(p2.verification_commands[0]!.unit_id).toBe("U2");
+    expect(p2.verification_commands[0]!.command).toBe("bun test:unit2");
+  });
+
+  it("requirement_defs are filtered to the unit's requirements (R-IDs)", () => {
+    const packet = buildWorkerPacket(plan, u1, plan.verification_commands);
+
+    expect(packet.unit.requirement_defs).toHaveLength(1);
+    expect(packet.unit.requirement_defs[0]!.id).toBe("R1");
+    expect(packet.unit.requirement_defs[0]!.text).toBe("Unit one.");
+  });
+});
+
+describe("planSlug", () => {
+  it("produces a kebab-case slug from the plan path", () => {
+    expect(planSlug("plans/02-Linear-Three-Unit.md")).toBe("02-linear-three-unit");
+    expect(planSlug("/abs/path/MyPlan.MD")).toBe("myplan");
+    expect(planSlug("relative/path/to/My-Cool_Plan.md")).toBe("my-cool-plan");
+    expect(planSlug("simple.md")).toBe("simple");
+    expect(planSlug("__UPPER__Path__.md")).toBe("upper-path");
   });
 });

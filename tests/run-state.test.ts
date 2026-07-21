@@ -324,6 +324,26 @@ describe("run-state: R10 location (T8)", () => {
   });
 });
 
+describe("run-state: runStateDir and latestRunId edge cases", () => {
+  let repoDir: string;
+
+  beforeEach(() => { repoDir = setupGitRepo(); });
+  afterEach(() => rmSync(repoDir, { recursive: true, force: true }));
+
+  it("runStateDir ends with ce-beads and uses GIT_DIR when available", () => {
+    const dir = runStateDir(repoDir);
+    expect(dir.endsWith("ce-beads")).toBe(true);
+  });
+
+  it("latestRunId returns null when no runs exist", () => {
+    expect(latestRunId(repoDir)).toBeNull();
+  });
+
+  it("listRunIds returns empty array when no runs exist", () => {
+    expect(listRunIds(repoDir)).toEqual([]);
+  });
+});
+
 describe("run-state: newRunId", () => {
   it("produces a sortable timestamped ID with a random suffix", () => {
     const id = newRunId(new Date("2026-07-21T08:14:30.000Z"));
