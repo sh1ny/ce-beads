@@ -1,0 +1,23 @@
+# Upstream checkouts — read-only, pinned, never vendored or modified
+upstream/
+
+# Dependencies
+node_modules/
+
+# Bun
+bun.lockb
+
+# Beads development workspace (initialized by U1)
+.beads/
+
+# Temp artifacts
+*.tmp
+tmp/
+
+# Vim swap files
+.*.swp
+.*.swo
+.*.sw*
+
+# Local environment report (machine-specific, never publish)
+docs/local-environment.md

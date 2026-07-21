@@ -1,0 +1,4 @@
+[test]
+# Only run tests from the project's tests/ directory, never from upstream/
+# checkouts or node_modules.
+root = "tests"

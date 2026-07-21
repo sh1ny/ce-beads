@@ -1,0 +1,70 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "Pinned upstream provenance and tested tool versions for ce-beads. Upstream checkouts are implementation provenance only (read-only, gitignored) and are NOT required at runtime — the skill invokes the `bd` CLI from PATH. Machine-specific paths (binary locations, local DB/workspace state) are intentionally omitted; see `docs/local-environment.md` (gitignored) for a local environment report.",
+  "upstreams": {
+    "compound-engineering-plugin": {
+      "repo": "https://github.com/EveryInc/compound-engineering-plugin",
+      "commit": "74ba763608d9f00172ca0b4b52e433934642dd0b",
+      "commit_subject": "fix: name what document identifiers refer to in rendered findings and POVs (#1198)",
+      "checkout_path": "upstream/compound-engineering-plugin",
+      "runtime_required": false,
+      "purpose": "Implementation provenance. The inspected contract files defined the CE plan schema that plan-parser.ts and graph-builder.ts target. Not read at runtime.",
+      "inspected_contract_files": [
+        "skills/ce-plan/SKILL.md",
+        "skills/ce-plan/references/plan-sections.md",
+        "skills/ce-plan/references/markdown-rendering.md",
+        "skills/ce-work/SKILL.md"
+      ]
+    },
+    "beads": {
+      "repo": "https://github.com/gastownhall/beads",
+      "commit": "1823f47ae42c93cb753536dfc49fa2337ace8eb1",
+      "commit_subject": "feat(validate): typed length bounds for assignee, owner, and label (#4894)",
+      "checkout_path": "upstream/beads",
+      "runtime_required": false,
+      "purpose": "Implementation provenance. The inspected contract files defined the bd CLI surface (graph_apply, init, create, list, update, dep, ready, show, close, metadata, types) that beads-client.ts wraps. Not read at runtime — runtime uses the `bd` binary on PATH.",
+      "inspected_contract_files": [
+        "cmd/bd/graph_apply.go",
+        "docs/cli-reference/init.md",
+        "docs/cli-reference/create.md",
+        "docs/cli-reference/list.md",
+        "docs/cli-reference/update.md",
+        "docs/cli-reference/dep.md",
+        "docs/cli-reference/ready.md",
+        "docs/cli-reference/show.md",
+        "docs/cli-reference/close.md",
+        "docs/core-concepts/dependencies.md",
+        "docs/core-concepts/metadata.md",
+        "internal/types/types.go",
+        "internal/beads/beads.go"
+      ]
+    }
+  },
+  "tools": {
+    "bd": {
+      "version": "1.1.0",
+      "version_output": "bd version 1.1.0 (8e4e59d39)",
+      "discovery": "on PATH"
+    },
+    "bun": {
+      "version": "1.3.14",
+      "discovery": "on PATH"
+    },
+    "omp": {
+      "version": "17.0.5",
+      "discovery": "on PATH"
+    },
+    "node": {
+      "version": "24.18.0",
+      "discovery": "on PATH"
+    },
+    "git": {
+      "version": "2.43.0",
+      "discovery": "on PATH"
+    }
+  },
+  "dev_workspace_init": {
+    "command": "bd init --non-interactive --init-if-missing --skip-agents --skip-hooks --stealth",
+    "note": "The development workspace is initialized at `.beads/` (gitignored) via `bd init` with no explicit database name; bd derives defaults. Database name, issue prefix, and backend are bd-managed runtime state, not pinned inventory."
+  }
+}
