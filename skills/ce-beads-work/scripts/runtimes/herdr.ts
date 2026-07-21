@@ -14,7 +14,6 @@ import type { CeUnit } from "../../../ce-beads/scripts/plan-parser.ts";
 import type { RunState } from "../run-state.ts";
 import {
   WORKER_RESULT_FILE,
-  WORKER_RESULT_TEMP,
   validateWorkerReport,
 } from "../worker-report.ts";
 import {
@@ -130,14 +129,31 @@ export class HerdrRuntime implements AgentRuntime {
       args.splice(4, 0, "--workspace", this.workspaceId);
     }
 
-    const result = await this.runHerdr(args);
-    const parsed = JSON.parse(result.stdout) as HerdrAgentStartResponse;
-    if (parsed.error) {
-      throw new Error(`herdr agent start failed: ${parsed.error.message}`);
+    let paneId: string | null = null;
+
+    // Primary path: herdr agent start with prompt as argv.
+    try {
+      const result = await this.runHerdr(args);
+      const parsed = JSON.parse(result.stdout) as HerdrAgentStartResponse;
+      if (parsed.error) {
+        throw new Error(`herdr agent start failed: ${parsed.error.message}`);
+      }
+      paneId = parsed.result?.agent?.pane_id ?? null;
+    } catch (e) {
+      // Fallback (peer-agents pattern): manual pane split + pane run.
+      // Used when herdr agent start loses the process before detection.
+      const msg = (e as Error).message;
+      try {
+        paneId = await this.manualSplitStart(handle, prompt, disposableBeadsDir);
+      } catch (fallbackErr) {
+        throw new Error(
+          `herdr agent start failed (${msg}); manual fallback also failed: ${(fallbackErr as Error).message}`,
+        );
+      }
     }
-    const paneId = parsed.result?.agent?.pane_id;
+
     if (!paneId) {
-      throw new Error("herdr agent start returned no pane_id");
+      throw new Error("Failed to create worker pane (no pane_id from either path)");
     }
     handle.paneId = paneId;
     handle.promptLifecycle = "sent";
@@ -162,9 +178,76 @@ export class HerdrRuntime implements AgentRuntime {
     }
   }
 
+  /**
+   * Manual fallback for pane creation when `herdr agent start` fails.
+   * Mirrors the peer-agents-skill pattern: split a pane, rename it, then
+   * use `pane run` to launch OMP with the prompt as the last argument.
+   * The prompt is delivered via shell command (cd + omp ... "<prompt>"),
+   * which is less clean than argv but works when agent start's process
+   * detection fails.
+   */
+  private async manualSplitStart(
+    handle: WorkerHandle,
+    prompt: string,
+    disposableBeadsDir: string,
+  ): Promise<string> {
+    const ws = handle.workspace;
+    const agentName = `ce-beads-${ws.unitId}`;
+
+    // Split a pane in the current workspace.
+    const splitArgs = ["pane", "split", "--direction", "right", "--no-focus"];
+    if (this.workspaceId) {
+      splitArgs.push("--workspace", this.workspaceId);
+    }
+    const splitResult = await this.runHerdr(splitArgs);
+    const splitParsed = JSON.parse(splitResult.stdout) as HerdrPaneSplitResponse;
+    if (splitParsed.error || !splitParsed.result?.pane?.pane_id) {
+      throw new Error(`pane split failed: ${splitParsed.error?.message ?? "no pane_id"}`);
+    }
+    const paneId = splitParsed.result.pane.pane_id;
+
+    // Rename the pane to the agent name.
+    try {
+      await this.runHerdr(["pane", "rename", paneId, agentName]);
+    } catch {
+      // best-effort — rename is cosmetic
+    }
+
+    // Launch OMP via `pane run` with the prompt as a shell argument.
+    // Construct a shell command that cd's to the worktree, sets BEADS_DIR,
+    // and launches omp with all flags + the prompt.
+    const systemPromptPath = join(ws.worktreePath, ".ce-beads-worker", "system-prompt.md");
+    const escapedPrompt = prompt.replace(/'/g, "'\\''");
+    const shellCommand = [
+      `cd '${ws.worktreePath}'`,
+      `export BEADS_DIR='${disposableBeadsDir}'`,
+      `'${this.ompPath}' --profile '${this.profile}' --model '${this.model}' --no-session --tools '${HERDR_WORKER_TOOLS.join(",")}' --append-system-prompt '${systemPromptPath}' '${escapedPrompt}'`,
+    ].join(" && ");
+    await this.runHerdr(["pane", "run", paneId, shellCommand]);
+
+    // Poll for agent detection (cold-start tolerance).
+    for (let i = 0; i < 20; i++) {
+      await sleep(1000);
+      try {
+        const getResult = await this.runHerdr(["agent", "get", paneId]);
+        const getParsed = JSON.parse(getResult.stdout) as HerdrAgentGetResponse;
+        if (!getParsed.error && getParsed.result?.agent?.agent_status) {
+          return paneId;
+        }
+      } catch {
+        // keep polling
+      }
+    }
+    return paneId;
+  }
+
   async wait(handle: WorkerHandle, opts: WaitOpts): Promise<WorkerResult> {
     const pollIntervalMs = opts.pollIntervalMs ?? 2000;
     const deadline = Date.now() + opts.timeoutMs;
+    // Track whether the agent has been observed working at least once.
+    // Without this, a fast agent can go idle→working→idle before we check,
+    // causing a false "died" detection (idle-race, peer-agents pattern).
+    let hasBeenWorking = false;
 
     for (;;) {
       // Deterministic path (R3): check result file existence.
@@ -189,14 +272,25 @@ export class HerdrRuntime implements AgentRuntime {
         };
       }
 
-      // Advisory fast-path: check if pane is dead.
+      // Advisory fast-path: check agent state for death detection.
       if (handle.paneId) {
         try {
           const result = await this.runHerdr(["agent", "get", handle.paneId]);
           const parsed = JSON.parse(result.stdout) as HerdrAgentGetResponse;
           if (parsed.error) {
-            // Agent not found → died.
-            return { kind: "died", reason: `agent not found: ${parsed.error.message}` };
+            // Agent not found → died (only after we've seen it working).
+            if (hasBeenWorking) {
+              return { kind: "died", reason: `agent not found: ${parsed.error.message}` };
+            }
+            // Haven't seen working yet — might still be starting. Keep polling.
+          } else {
+            const status = parsed.result?.agent?.agent_status;
+            if (status === "working") {
+              hasBeenWorking = true;
+            }
+            // Only treat "idle" as potentially dead if we've seen working
+            // and the result file is still absent after sustained idleness.
+            // The file (R3) is the truth — idle alone doesn't mean done.
           }
         } catch {
           // herdr command failed — might be transient, keep polling.
@@ -282,6 +376,15 @@ interface HerdrAgentStartResponse {
       terminal_id: string;
       workspace_id: string;
       agent_status: string;
+    };
+  };
+  error?: { code: string; message: string };
+}
+interface HerdrPaneSplitResponse {
+  id: string;
+  result?: {
+    pane?: {
+      pane_id: string;
     };
   };
   error?: { code: string; message: string };

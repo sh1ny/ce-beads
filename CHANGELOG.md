@@ -19,6 +19,8 @@
 - `runtimes/herdr.ts`: HerdrRuntime — production AgentRuntime using `herdr agent start` with prompt-as-argv (pi-overseer pattern); file-based completion (R3); `herdr agent get` advisory state checks
 - `run.ts`: run action handler — dispatches to RunEngine for start/status/resume/reap/abandon
 - `agents/ce-beads-unit.md`: bundled worker agent file (R9) with restricted tools whitelist
+- HerdrPaneSplitResponse type for pane split API
+- Manual pane split fallback using peer-agents pattern when herdr agent start process detection fails
 
 ### Changed
 - `beads-client.ts`: `BeadsClient.update()` now accepts `assignee?: string` (empty string clears assignee; required for abandon contract's `bd update --status open --assignee ""`).
@@ -44,6 +46,7 @@
 ### Fixed
 - Deduplicated repeated entries in unreleased changelog section
 - Test files updated to use `makeCliArgs` helper (status, sync, doctor, bind)
+- Fixed idle-race detection in HerdrRuntime wait() — tracks hasBeenWorking before treating agent-not-found as died
 ## 0.1.0 — 2026-07-21
 ### Added
 
