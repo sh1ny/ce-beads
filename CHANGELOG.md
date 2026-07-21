@@ -1,7 +1,18 @@
 # Changelog
 
-## 0.1.0 — 2026-07-21
+## Unreleased
 
+### Added
+- ce-beads-work serial orchestrator foundation (in progress): protocol extended with `packet` and `run` actions, `PacketOutcome`/`RunOutcome` enums, and 14 new diagnostic codes (`UNIT_NOT_FOUND` through `EXTERNAL_CHANGE`) with corresponding `exitCodeFor` mappings.
+- Plan parser extended: parses Verification Contract tables into typed `VerificationEntry[]`, requirement definitions (`R-ID` → text) into `requirement_defs`, and KTD excerpts per unit.
+- `worker-report.ts`: `WorkerReport` schema (`ce-beads-worker-report/1`), strict structural validation, fallback pane-output JSON extraction.
+- `run-state.ts`: `RunState`/`RunUnitRecord` with 6-state unit lifecycle (`pending→claimed→worker_finished→captured→merged→verified→closed`, with `blocked`), crash recovery via `last_successful_state` + `prompt_lifecycle`, atomic file persistence, `findActiveRunForPlan` (mid-initialization detection).
+- `git.ts`: minimal git helper functions (worktree add/remove, branch delete, merge with conflict detection, diff-stat, porcelain status, atomic add+commit) using `node:child_process`.
+- Plan parser extended: parses Verification Contract tables into typed `VerificationEntry[]`, requirement definitions (`R-ID` → text) into `requirement_defs`, and KTD excerpts per unit
+- `worker-report.ts`: `WorkerReport` schema (`ce-beads-worker-report/1`), strict structural validation, fallback pane-output JSON extraction
+- `run-state.ts`: `RunState`/`RunUnitRecord` with 6-state unit lifecycle (`pending→claimed→worker_finished→captured→merged→verified→closed`, with `blocked`), crash recovery via `last_successful_state` + `prompt_lifecycle`, atomic file persistence, `findActiveRunForPlan` (mid-initialization detection)
+- `git.ts`: minimal git helper functions (worktree add/remove, branch delete, merge with conflict detection, diff-stat, porcelain status, atomic add+commit) using `node:child_process`
+## 0.1.0 — 2026-07-21
 ### Added
 
 - ce-beads OMP bridge MVP: imports Compound Engineering implementation-ready plans (`ce-unified-plan/v1`, `implementation-ready`, `execution: code`) into a Beads dependency graph.
