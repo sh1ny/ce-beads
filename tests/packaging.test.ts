@@ -5,7 +5,7 @@
 // state, and pack payload. Mirrors conventions from docs.test.ts.
 
 import { describe, expect, it } from "bun:test";
-import { readFileSync, existsSync, statSync, mkdtempSync, copyFileSync } from "node:fs";
+import { readFileSync, existsSync, statSync, mkdtempSync, copyFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
@@ -85,7 +85,7 @@ describe("packaging: no .omp/skills dependency", () => {
   const TARGETS: string[] = [];
   const collectDir = (dir: string): string[] => {
     const acc: string[] = [];
-    for (const entry of require("node:fs").readdirSync(dir, { withFileTypes: true })) {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
       const full = join(dir, entry.name);
       if (entry.isDirectory()) {
         acc.push(...collectDir(full));
