@@ -7,7 +7,6 @@
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
-import { spawn } from "node:child_process";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import type { CeUnit } from "../../../ce-beads/scripts/plan-parser.ts";
@@ -350,18 +349,20 @@ export class HerdrRuntime implements AgentRuntime {
 
   // --- Internal helpers ----------------------------------------------------
 
-  private runHerdr(args: string[]): Promise<{ stdout: string; stderr: string; exitCode: number }> {
-    const { promise, resolve } = Promise.withResolvers<{ stdout: string; stderr: string; exitCode: number }>();
-    const child = spawn(this.herdrPath, args, {
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    let stdout = "";
-    let stderr = "";
-    child.stdout?.on("data", (d: Buffer) => (stdout += d.toString()));
-    child.stderr?.on("data", (d: Buffer) => (stderr += d.toString()));
-    child.on("close", (code) => resolve({ stdout, stderr, exitCode: code ?? 0 }));
-    child.on("error", (err) => resolve({ stdout, stderr: err.message, exitCode: 1 }));
-    return promise;
+  private async runHerdr(args: string[]): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+    // Use Bun.$ to avoid Bun's posix_spawn ENOENT bug (same fix as git.ts runInDir).
+    // Bun.$ handles array interpolation with proper shell escaping.
+    try {
+      const result = await Bun.$`${this.herdrPath} ${args}`.quiet();
+      return { stdout: result.stdout.toString(), stderr: result.stderr.toString(), exitCode: result.exitCode };
+    } catch (e) {
+      const err = e as { stdout?: Uint8Array; stderr?: Uint8Array; exitCode?: number };
+      return {
+        stdout: err.stdout?.toString() ?? "",
+        stderr: err.stderr?.toString() ?? (e as Error).message,
+        exitCode: err.exitCode ?? -1,
+      };
+    }
   }
 }
 

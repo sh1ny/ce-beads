@@ -3,7 +3,6 @@
 // HERE (P1-4/P1-5), not in the runtime, so MockRuntime and HerdrRuntime
 // exercise the identical commit/integration path.
 
-import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { mkdir, writeFile, readFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -1172,17 +1171,18 @@ function stableHash(input: string): string {
 
 // --- Process helpers -------------------------------------------------------
 
-function runCommand(command: string, cwd: string): Promise<{ stdout: string; stderr: string; exitCode: number }> {
-  const { promise, resolve } = Promise.withResolvers<{ stdout: string; stderr: string; exitCode: number }>();
-  const child = spawn("bash", ["-c", command], {
-    cwd,
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-  let stdout = "";
-  let stderr = "";
-  child.stdout?.on("data", (d: Buffer) => (stdout += d.toString()));
-  child.stderr?.on("data", (d: Buffer) => (stderr += d.toString()));
-  child.on("close", (code) => resolve({ stdout, stderr, exitCode: code ?? 0 }));
-  return promise;
+async function runCommand(command: string, cwd: string): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+  // Use Bun.$ to avoid Bun's posix_spawn ENOENT bug (same fix as git.ts runInDir).
+  try {
+    const result = await Bun.$`bash -c ${command}`.cwd(cwd).quiet();
+    return { stdout: result.stdout.toString(), stderr: result.stderr.toString(), exitCode: result.exitCode };
+  } catch (e) {
+    const err = e as { stdout?: Uint8Array; stderr?: Uint8Array; exitCode?: number };
+    return {
+      stdout: err.stdout?.toString() ?? "",
+      stderr: err.stderr?.toString() ?? (e as Error).message,
+      exitCode: err.exitCode ?? -1,
+    };
+  }
 }
 
