@@ -511,6 +511,10 @@ export interface RunUnitRecord {
   last_successful_state: UnitRunState | null;
   /** Human-readable reason the unit blocked; empty string when not blocked. */
   blocker_reason: string;
+  /** Prompt dispatch lifecycle (persisted, P1-2): not_sent | dispatching | sent. */
+  prompt_lifecycle: "not_sent" | "dispatching" | "sent";
+  /** Attempt number (starts at 1, increments on retry — prevents worktree collision). */
+  attempt: number;
 }
 
 export interface RunState {
@@ -556,22 +560,22 @@ export function listRunIds(repoRoot?: string): string[];    // sorted, newest la
 export function latestRunId(repoRoot?: string): string | null;
 /**
  * Returns an active run for the same plan, if any. A run is "active" when:
- *   - status === "in_progress" || status === "blocked" || status === "failed",
- *   - AND it still owns at least one unit in a non-closed, non-terminal
- *     per-unit state (claimed / worker_finished / captured / merged /
- *     verified / blocked — i.e. NOT "closed" and NOT "pending").
+ *   - status === "in_progress" (ALWAYS active — even with empty units,
+ *     because it may be mid-initialization; the integration worktree may
+ *     exist even though no unit has been claimed yet), OR
+ *   - status === "blocked" or "failed" AND it still owns at least one
+ *     unit in a non-closed, non-terminal per-unit state (claimed /
+ *     worker_finished / captured / merged / verified / blocked).
  *
- * Rationale: a failed run may still own claimed Beads tasks and unfinished
- * worker work; `run start` MUST refuse (RUN_ACTIVE) until the human
- * explicitly retries or releases the tasks via `run abandon`. By contrast,
- * a failed run
- * whose every unit is closed is terminal and is NOT active — it does not
- * block a fresh start.
+ * Rationale: an in_progress run with empty units is mid-setup — the
+ * integration worktree may exist, and `run start` must refuse to avoid
+ * orphaning it. A failed run may own claimed Beads tasks; `run start`
+ * MUST refuse (RUN_ACTIVE) until the human retries or releases via
+ * `run abandon`. A failed run whose every unit is closed is terminal
+ * and NOT active.
  *
- * In short: status in {in_progress, blocked, failed} AND at least one unit
- * with state in {claimed, worker_finished, captured, merged, verified,
- * blocked}. status === "completed" is never active. Abandoned runs are NOT
- * active (their Beads tasks were released).
+ * In short: in_progress is ALWAYS active. blocked/failed is active iff
+ * it owns unfinished tasks. completed/abandoned are never active.
  */
 export function findActiveRunForPlan(planPath: string, repoRoot?: string): RunState | null;
 ```
@@ -730,13 +734,17 @@ The constructor resolves `profile = opts.profile ?? process.env.CE_BEADS_OMP_PRO
 Implementation contract (exact command sequences; every herdr invocation
 parses the `{"id":…,"result":…}` JSON envelope):
 
-- `createWorkspace`: `git worktree add <worktreeRoot>/<U-ID>-<run-id>
-  -b ce-beads/<U-ID>-<run-id> <forkSha>` (plain git — the brief's own
-  Herdr command list has no worktree verbs; FS state must not depend on a
-  live Herdr server). Then `mkdir .ce-beads-worker/` inside the worktree,
-  remove any stale `result.json` and `.result.tmp` so neither exists, and
-  return the `Workspace` (`unitId`, `worktreePath`, `branch`). It does NOT
-  write `system-prompt.md` or `packet.json` — the engine writes both after
+- `createWorkspace`: `git worktree add <worktreeRoot>/<U-ID>-<run-id>-a<N>
+  -b ce-beads/<U-ID>-<run-id>-a<N> <forkSha>` where `<N>` is the attempt
+  number (starts at 1, increments on each retry). This prevents worktree
+  path collisions when retry re-launches a worker (the previous attempt's
+  worktree is preserved per P1-5). Old worktrees are archived, not
+  overwritten. The engine tracks the current attempt number in
+  RunUnitRecord (add `attempt: number` field, default 1).
+  Then `mkdir .ce-beads-worker/` inside the worktree, remove any stale
+  `result.json` and `.result.tmp` so neither exists, and return the
+  `Workspace` (`unitId`, `worktreePath`, `branch`). It does NOT write
+  `system-prompt.md` or `packet.json` — the engine writes both after
   building the packet in loop step 4f. The worker creates `.result.tmp`,
   writes it, and renames it to `result.json`; the adapter polls for
   `result.json` existence (R3).
@@ -762,9 +770,11 @@ parses the `{"id":…,"result":…}` JSON envelope):
   6. Return WorkerHandle with paneId set, promptLifecycle = "not_sent".
      The engine persists pane_id IMMEDIATELY.
 - `startWorkerPhase2(handle, prompt)`:
-  1. `herdr pane run <pane_id> '<rendered prompt>'` (prompt includes
-     the result-file path; see §3). Never treat the pre-prompt `idle`
-     as completion (skill gotcha).
+  1. `herdr pane send-text <pane_id> '<rendered prompt>'` then
+     `herdr pane send-keys <pane_id> enter` (pane send-text delivers the
+     text to the pane's input; send-keys enter submits it. Do NOT use
+     `herdr pane run` — that executes a shell command, not a prompt to
+     the OMP session. Prompt includes the result-file path; see §3.)
   2. Set handle.promptLifecycle = "sent". Return.
 - `wait`: loop until `opts.timeoutMs`:
   - **Deterministic path (authoritative, R3):** check
@@ -866,31 +876,34 @@ export class RunEngine {
    * run abandon: releases coordinator-owned Beads state for a blocked/failed
    * run. For each non-closed unit (per the preview):
    *
-   * Beads mutation contract:
-   * 1. Read back the task's current assignee via `bd show <id> --json`.
-   *    If assignee does NOT match this run's coordinator identity →
-   *    EXTERNAL_CHANGE diagnostic, skip this task, continue to next.
-   *    (Another run or human took ownership — do NOT unclaim.)
-   * 2. Unclaim: `bd assign <id> ""` (clears assignee; status reverts to
-   *    open). The existing BeadsClient.update() cannot clear an assignee,
-   *    so extend it: `update(id, { assignee?: string })` where
-   *    `assignee === ""` clears it (test using `!== undefined`).
-   *    Alternatively call `bd assign <id> ""` directly — both are valid;
-   *    the plan pins `bd assign` as the implementation.
-   * 3. Remove coordinator labels: `bd update <id> --remove-label
-   *    ce-beads:worker-finished` (and ce-beads:blocked, etc. — every
-   *    ce-beads:* label this run added).
-   * 4. Clear coordinator metadata: `bd update <id> --metadata
-   *    ce_beads_run_state= --metadata ce_beads_blocker_reason=` (clear
-   *    every ce_beads_* key this run set).
-   * 5. Read back the task to confirm the mutation applied.
-   * 6. Partial failure: if any single task's mutation fails, record it as
-   *    PARTIAL_APPLY, continue to the next task. At the end, if any
-   *    PARTIAL_APPLY occurred, the run is marked "failed" (not
-   *    "abandoned") and the outcome includes PARTIAL_APPLY diagnostics.
-   *    The human can retry abandon or reap.
-   * 7. Only tasks actually claimed by THIS run are restored — verified by
-   *    the assignee read-back in step 1.
+ * Beads mutation contract (verified against bd 1.1.0):
+ * 1. Read back the task via `bd show <id> --json`. Verify
+ *    `metadata.ce_beads_run_id === run.run_id` — this is the ownership
+ *    proof, NOT assignee equality (assignee can be changed without
+ *    unclaiming). If run_id doesn't match → EXTERNAL_CHANGE, skip.
+ * 2. Reopen: `bd update <id> --status open --assignee "" --json`.
+ *    NOTE: `bd assign <id> ""` only clears the assignee but does NOT
+ *    change status from in_progress back to open. Use `bd update` with
+ *    both --status open and --assignee "" together. Extend
+ *    BeadsClient.update() to accept `status?: string` and
+ *    `assignee?: string` (test using `!== undefined`).
+ * 3. Remove coordinator labels: `bd update <id> --remove-label
+ *    ce-beads:worker-finished` (and ce-beads:blocked, ce-beads:claimed,
+ *    etc. — every ce-beads:* label this run added).
+ * 4. Clear coordinator metadata: `bd update <id> --unset-metadata
+ *    ce_beads_run_state --unset-metadata ce_beads_blocker_reason
+ *    --unset-metadata ce_beads_run_id` (use --unset-metadata, NOT
+ *    --metadata key= which is not the clearing API).
+ * 5. Read back the task to confirm: status === open, assignee === null,
+ *    ce_beads_run_id absent, ce-beads:* labels absent. Only then mark
+ *    this task as released.
+ * 6. Partial failure: if any single task's mutation fails, record it as
+ *    PARTIAL_APPLY, continue to the next task. At the end, if any
+ *    PARTIAL_APPLY occurred, the run is marked "failed" (not
+ *    "abandoned") and the outcome includes PARTIAL_APPLY diagnostics.
+ *    The human can retry abandon or reap.
+ * 7. Only tasks with ce_beads_run_id === run.run_id are restored —
+ *    verified by the read-back in step 1.
    *
    * After all tasks processed: mark run-state "abandoned". Does NOT close
    * or delete Beads tasks. Does NOT delete worktrees or branches (use reap
