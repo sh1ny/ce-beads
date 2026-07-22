@@ -252,9 +252,11 @@ export class RunEngine {
       ]);
     }
 
-    // If blocked and no retry, return immediately.
-    if (state.status === "blocked" && !opts?.retry) {
-      return this.statusEnvelope(state, "blocked");
+    // If blocked or failed with blocked units and no retry, return immediately.
+    // A failed run with unfinished units is still ownership-active but must
+    // not advance without --retry (ce-beads-thread-Szw2q).
+    if ((state.status === "blocked" || state.status === "failed") && !opts?.retry) {
+      return this.statusEnvelope(state, state.status === "failed" ? "failed" : "blocked");
     }
 
     const client = new BeadsClient({ beadsDir: this.beadsDir });
@@ -729,8 +731,15 @@ export class RunEngine {
             message: `Worker ${report.status} for ${unitId}: ${report.blockers || "worker reported failure"}`,
           });
         }
-        // timeout or died — fall through to clear and relaunch.
+        // timeout or died — block the unit instead of relaunching.
+        // Relaunching without --retry would reuse a dirty worktree and
+        // risk committing stale partial changes (ce-beads-thread-Szw2t, P1).
         state.status = waitResult.kind === "timeout" ? "blocked" : "failed";
+        return this.blockUnit(state, client, record, unitId, "claimed", {
+          code: "WORKER_FAILED",
+          severity: "blocking",
+          message: `Worker ${waitResult.kind} for ${unitId} after resume; use --retry to relaunch.`,
+        });
       }
       // Clear any stale/invalid result file from a previous attempt (R3).
       await rm(resultFile, { force: true });
@@ -965,7 +974,7 @@ export class RunEngine {
     if (record.state === "captured") {
       const verifyResult = await this.runVerification(plan, unitId, record.worktree_path!);
       if (!verifyResult.ok) {
-        return this.blockUnit(state, client, record, unitId, "captured", {
+        return this.blockUnit(state, client, record, unitId, "worker_finished", {
           code: "VERIFICATION_FAILED",
           severity: "blocking",
           message: `Pre-merge verification failed for ${unitId}: ${verifyResult.error}`,
@@ -982,11 +991,24 @@ export class RunEngine {
         `ce-beads(${unitId}): merge worker branch (${state.run_id})`,
       );
       if (mergeResult.conflict) {
-        return this.blockUnit(state, client, record, unitId, "captured", {
-          code: "INTEGRATION_FAILED",
-          severity: "blocking",
-          message: `Merge conflict for ${unitId}: left for human resolution.`,
-        });
+        // Merge conflicts are NOT auto-retryable — the integration worktree
+        // has an in-progress merge that must be aborted or resolved by a
+        // human. Setting last_successful_state = null prevents --retry
+        // from restoring a state that would re-enter mergeBranch with a
+        // dirty index (ce-beads-thread-Szw2x, P2).
+        record.last_successful_state = null;
+        record.blocker_reason = `Merge conflict for ${unitId}: left for human resolution. Abort the merge in ${state.integration_worktree} or resolve manually.`;
+        record.state = "blocked";
+        state.status = state.status === "in_progress" ? "blocked" : state.status;
+        saveRunState(state, this.repoRoot);
+        return {
+          kind: "blocked",
+          diagnostics: [{
+            code: "INTEGRATION_FAILED",
+            severity: "blocking",
+            message: `Merge conflict for ${unitId}: left for human resolution.`,
+          }],
+        };
       }
       record.merge_sha = mergeResult.mergeSha;
       record.state = "merged";
