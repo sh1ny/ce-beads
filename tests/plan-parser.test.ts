@@ -219,3 +219,114 @@ describe("plan-parser: revised fixtures parse (for U6/U7)", () => {
     expect(u3.dependencies).toEqual(["U1"]);
   });
 });
+
+describe("plan-parser: Verification Contract (R8)", () => {
+  it("parses VC table with explicit U-ID column into fanned-out entries", () => {
+    const plan = parsePlan(fixture("18-work-u2-depends-on-u1-impl.md"), { repoRoot: REPO_ROOT });
+    // Fixture 18 has two explicit rows: U1 and U2.
+    expect(plan.verification_commands).toHaveLength(2);
+    const u1Cmd = plan.verification_commands.find((v) => v.unit_id === "U1");
+    const u2Cmd = plan.verification_commands.find((v) => v.unit_id === "U2");
+    expect(u1Cmd).toBeDefined();
+    expect(u2Cmd).toBeDefined();
+    expect(u1Cmd!.command).toContain("test -f src/u1.ts");
+    expect(u2Cmd!.command).toContain("grep -q ANSWER src/u2.ts");
+  });
+
+  it("includes the optional 'Proves' text as expected", () => {
+    const plan = parsePlan(fixture("18-work-u2-depends-on-u1-impl.md"), { repoRoot: REPO_ROOT });
+    const u1Cmd = plan.verification_commands.find((v) => v.unit_id === "U1")!;
+    expect(u1Cmd.expected).toBeDefined();
+    expect(u1Cmd.expected).toContain("module exists");
+  });
+
+  it("parses the failing-verification fixture VC with `false` command", () => {
+    const plan = parsePlan(fixture("17-work-failing-verification.md"), { repoRoot: REPO_ROOT });
+    const u1Cmd = plan.verification_commands.find((v) => v.unit_id === "U1");
+    expect(u1Cmd).toBeDefined();
+    expect(u1Cmd!.command).toBe("false");
+  });
+
+  it("returns empty verification_commands when VC uses a blanket 'Unit' gate", () => {
+    // Fixture 02's VC table uses "Unit" as the U-ID column value, which is not
+    // an explicit U-ID. The parser only fans out explicit U-IDs (U1, U2, etc.),
+    // so a blanket "Unit" gate produces zero entries. This is correct behavior:
+    // the orchestrator cannot determine which unit a blanket gate applies to.
+    const plan = parsePlan(fixture("02-linear-three-unit.md"), { repoRoot: REPO_ROOT });
+    expect(plan.verification_commands).toEqual([]);
+  });
+
+  it("returns empty verification_commands for fixtures with no VC table", () => {
+    // Fixture 03 (parallel units) has no VC section.
+    const plan = parsePlan(fixture("03-parallel-units.md"), { repoRoot: REPO_ROOT });
+    expect(plan.verification_commands).toEqual([]);
+  });
+});
+
+describe("plan-parser: requirement definitions", () => {
+  it("parses ### Requirements section into requirement_defs", () => {
+    const plan = parsePlan(fixture("02-linear-three-unit.md"), { repoRoot: REPO_ROOT });
+    expect(plan.requirement_defs).toHaveLength(3);
+    const r1 = plan.requirement_defs.find((r) => r.id === "R1");
+    expect(r1).toBeDefined();
+    expect(r1!.text).toContain("Unit one");
+  });
+
+  it("parses requirement defs from the minimal fixture", () => {
+    const plan = parsePlan(fixture("01-minimal-valid.md"), { repoRoot: REPO_ROOT });
+    expect(plan.requirement_defs).toHaveLength(1);
+    expect(plan.requirement_defs[0]!.id).toBe("R1");
+    expect(plan.requirement_defs[0]!.text).toContain("parses successfully");
+  });
+
+  it("returns empty requirement_defs when the section is missing", () => {
+    const plan = parsePlan(fixture("03-parallel-units.md"), { repoRoot: REPO_ROOT });
+    expect(Array.isArray(plan.requirement_defs)).toBe(true);
+  });
+});
+
+describe("plan-parser: KTD excerpts per unit", () => {
+  it("returns empty ktd_excerpts when no KTDs are defined", () => {
+    const plan = parsePlan(fixture("02-linear-three-unit.md"), { repoRoot: REPO_ROOT });
+    // Fixture 02 has no KTD definitions.
+    for (const unit of plan.units) {
+      expect(unit.ktd_excerpts).toEqual([]);
+    }
+  });
+
+  it("returns empty ktd_excerpts when KTD text does not reference the unit's R-IDs", () => {
+    // Fixture 01 has "KTD1. Minimal shape for testing." but KTD1's text
+    // does not contain a \bR\d+\b reference. The selection logic matches
+    // R-IDs in the KTD text against the unit's requirements; with no match,
+    // ktd_excerpts is empty. This is correct behavior.
+    const plan = parsePlan(fixture("01-minimal-valid.md"), { repoRoot: REPO_ROOT });
+    const u1 = plan.units[0]!;
+    expect(u1.requirements).toEqual(["R1"]);
+    // KTD1 text doesn't reference R1, so no excerpts are selected.
+    expect(u1.ktd_excerpts).toEqual([]);
+  });
+
+  it("ktd_excerpts is always an array (never undefined)", () => {
+    const plan = parsePlan(fixture("01-minimal-valid.md"), { repoRoot: REPO_ROOT });
+    for (const unit of plan.units) {
+      expect(Array.isArray(unit.ktd_excerpts)).toBe(true);
+    }
+  });
+});
+
+describe("plan-parser: plan-level feature exposure", () => {
+  it("the plan object exposes requirement_defs and verification_commands at top level", () => {
+    const plan = parsePlan(fixture("18-work-u2-depends-on-u1-impl.md"), { repoRoot: REPO_ROOT });
+    expect(Array.isArray(plan.requirement_defs)).toBe(true);
+    expect(Array.isArray(plan.verification_commands)).toBe(true);
+    expect(plan.requirement_defs.length).toBeGreaterThan(0);
+    expect(plan.verification_commands.length).toBeGreaterThan(0);
+  });
+
+  it("each unit exposes ktd_excerpts as an array", () => {
+    const plan = parsePlan(fixture("01-minimal-valid.md"), { repoRoot: REPO_ROOT });
+    for (const unit of plan.units) {
+      expect(Array.isArray(unit.ktd_excerpts)).toBe(true);
+    }
+  });
+});

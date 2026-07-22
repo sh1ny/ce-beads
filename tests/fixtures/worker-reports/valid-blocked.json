@@ -1,0 +1,11 @@
+{
+  "schema_version": "ce-beads-worker-report/1",
+  "u_id": "U2",
+  "status": "blocked",
+  "changed_files": [],
+  "verification_evidence": {
+    "commands": [],
+    "results": "could not proceed: missing dependency artifact"
+  },
+  "blockers": "U1's implementation file is not present in the worktree; cannot import."
+}

@@ -28,7 +28,7 @@ describe("packaging: manifest", () => {
 
   it("package.json bin, files, engines, os, keywords, omp deep-equal the step-2c literals", () => {
     expect(pkg.bin).toEqual({ "ce-beads": "skills/ce-beads/scripts/cli.ts" });
-    expect(pkg.files).toEqual(["skills/", "README.md", "UPSTREAMS.lock.json"]);
+    expect(pkg.files).toEqual(["skills/", "agents/", "README.md", "UPSTREAMS.lock.json"]);
     expect(pkg.engines).toEqual({ bun: ">=1.3.14" });
     expect(pkg.os).toEqual(["linux"]);
     expect(pkg.keywords).toEqual([
@@ -40,6 +40,7 @@ describe("packaging: manifest", () => {
     expect(pkg.omp).toEqual({
       name: "ce-beads",
       description: "Bridge Compound Engineering implementation-ready plans into Beads dependency graphs.",
+      skills: ["./skills"],
     });
   });
 

@@ -1,0 +1,12 @@
+{
+  "schema_version": "ce-beads-worker-report/1",
+  "u_id": "U1",
+  "status": "complete",
+  "changed_files": ["src/u1.ts"],
+  "verification_evidence": {
+    "commands": ["bun test"],
+    "results": "all tests passed"
+  },
+  "blockers": "",
+  "notes": "Implementation complete."
+}

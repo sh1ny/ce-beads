@@ -4,6 +4,7 @@ import { handler as bindHandler } from "../skills/ce-beads/scripts/bind.ts";
 import { handler as statusHandler } from "../skills/ce-beads/scripts/status.ts";
 import { BeadsClient } from "../skills/ce-beads/scripts/beads-client.ts";
 import type { CliArgs } from "../skills/ce-beads/scripts/cli.ts";
+import { makeCliArgs } from "../skills/ce-beads/scripts/cli.ts";
 import {
   setupWorkspace,
   snapshotDevRepo,
@@ -13,18 +14,17 @@ import {
 } from "./helpers/beads-workspace.ts";
 
 const FIXTURES = join(import.meta.dir, "fixtures", "plans");
-
 function args(planPath: string): CliArgs {
-  return { action: "status", planPath, json: true, applyToken: undefined, help: false };
+  return makeCliArgs({ action: "status", planPath, json: true });
 }
 
 async function bind(ws: WorkspaceFixture, fixture: string): Promise<Record<string, string>> {
   const oldDir = process.env.BEADS_DIR;
   process.env.BEADS_DIR = ws.client.beadsDir;
   const planPath = join(FIXTURES, fixture);
-  const preview = await bindHandler.run({ action: "bind", planPath, json: true, applyToken: undefined, help: false });
+  const preview = await bindHandler.run(makeCliArgs({ action: "bind", planPath, json: true }));
   const token = (preview.data as { approvalToken: string }).approvalToken;
-  const env = await bindHandler.run({ action: "bind", planPath, json: true, applyToken: token, help: false });
+  const env = await bindHandler.run(makeCliArgs({ action: "bind", planPath, json: true, applyToken: token }));
   process.env.BEADS_DIR = oldDir;
   return (env.data as { mapping: Record<string, string> }).mapping;
 }

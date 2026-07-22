@@ -19,7 +19,7 @@ export const PROTOCOL_VERSION = "ce-beads-protocol/1" as const;
 
 // --- Actions ---------------------------------------------------------------
 
-export type Action = "doctor" | "bind" | "status" | "sync";
+export type Action = "doctor" | "bind" | "status" | "sync" | "packet" | "run";
 
 // --- Outcomes (per-action closed enums) -------------------------------------
 
@@ -28,7 +28,21 @@ export type BindOutcome = "bound" | "already_bound" | "binding_drift" | "preview
 export type StatusOutcome = "unchanged" | "drift" | "blocked";
 export type SyncOutcome = "preview" | "applied" | "partial" | "blocked" | "refused";
 
-export type Outcome = DoctorOutcome | BindOutcome | StatusOutcome | SyncOutcome;
+export type PacketOutcome = "packet_built" | "unit_not_found";
+
+export type RunOutcome =
+  | "in_progress"
+  | "awaiting_integration"
+  | "completed"
+  | "blocked"
+  | "failed"
+  | "reaped"
+  | "abandoned"
+  | "preview"
+  | "not_found"
+  | "refused";
+
+export type Outcome = DoctorOutcome | BindOutcome | StatusOutcome | SyncOutcome | PacketOutcome | RunOutcome;
 
 // --- Exit codes (KTD15 taxonomy) -------------------------------------------
 
@@ -51,6 +65,7 @@ export type ExitCodeValue = (typeof ExitCode)[keyof typeof ExitCode];
 export type DiagnosticSeverity = "info" | "warning" | "error" | "blocking";
 
 export type DiagnosticCode =
+  | "USAGE"
   | "PLAN_UNSUPPORTED"
   | "PLAN_MALFORMED"
   | "BD_MISSING"
@@ -66,7 +81,21 @@ export type DiagnosticCode =
   | "LOCK_BUSY"
   | "BD_FAILURE"
   | "READBACK_FAILURE"
-  | "PARTIAL_APPLY";
+  | "PARTIAL_APPLY"
+  | "UNIT_NOT_FOUND"
+  | "NOT_BOUND"
+  | "RUN_ACTIVE"
+  | "RUN_NOT_FOUND"
+  | "RUN_STATE_CORRUPT"
+  | "WORKER_FAILED"
+  | "WORKER_REPORT_INVALID"
+  | "WORKER_BLOCKED"
+  | "VERIFICATION_FAILED"
+  | "INTEGRATION_FAILED"
+  | "CHANGED_FILES_INVALID"
+  | "RUNTIME_FAILURE"
+  | "PLAN_DIGEST_DRIFT"
+  | "EXTERNAL_CHANGE";
 
 export interface Diagnostic {
   code: DiagnosticCode;
@@ -187,25 +216,32 @@ export function exitCodeFor(
   action: Action,
   outcome: Outcome,
   diagnostics: Diagnostic[],
+  ok: boolean = false,
 ): ExitCodeValue {
+  // On success envelopes, warning-level diagnostics are informational
+  // and must not produce non-zero exit codes. Filter them out.
+  const diags = ok
+    ? diagnostics.filter((d) => d.severity !== "warning")
+    : diagnostics;
+
   // If any blocking diagnostic, it's a conflict (exit 5) unless it's
   // environment-related (exit 4) or a plan issue (exit 3).
-  const hasBlocking = diagnostics.some((d) => d.severity === "blocking");
-  const hasError = diagnostics.some((d) => d.severity === "error");
+  const hasBlocking = diags.some((d) => d.severity === "blocking");
+  const hasError = diags.some((d) => d.severity === "error");
 
   // Environment issues.
-  if (diagnostics.some((d) => d.code === "BD_MISSING")) return ExitCode.PRECONDITION;
-  if (diagnostics.some((d) => d.code === "WORKSPACE_UNINITIALIZED")) return ExitCode.PRECONDITION;
+  if (diags.some((d) => d.code === "BD_MISSING")) return ExitCode.PRECONDITION;
+  if (diags.some((d) => d.code === "WORKSPACE_UNINITIALIZED")) return ExitCode.PRECONDITION;
 
   // Plan issues.
-  if (diagnostics.some((d) => d.code === "PLAN_UNSUPPORTED")) return ExitCode.UNSUPPORTED_PLAN;
-  if (diagnostics.some((d) => d.code === "PLAN_MALFORMED")) return ExitCode.UNSUPPORTED_PLAN;
+  if (diags.some((d) => d.code === "PLAN_UNSUPPORTED")) return ExitCode.UNSUPPORTED_PLAN;
+  if (diags.some((d) => d.code === "PLAN_MALFORMED")) return ExitCode.UNSUPPORTED_PLAN;
 
   // Lock busy.
-  if (diagnostics.some((d) => d.code === "LOCK_BUSY")) return ExitCode.LOCK_BUSY;
+  if (diags.some((d) => d.code === "LOCK_BUSY")) return ExitCode.LOCK_BUSY;
 
   // Token mismatch.
-  if (diagnostics.some((d) => d.code === "TOKEN_MISMATCH")) return ExitCode.CONFLICT;
+  if (diags.some((d) => d.code === "TOKEN_MISMATCH")) return ExitCode.CONFLICT;
 
   // Preview is success (exit 0) — it's not a failure, even if it carries an
   // info-level PARTIAL_APPLY diagnostic telling the user to re-run with --apply.
@@ -213,18 +249,30 @@ export function exitCodeFor(
 
   // Partial / indeterminate.
   if (outcome === "partial") return ExitCode.PARTIAL;
-  if (diagnostics.some((d) => d.code === "PARTIAL_APPLY")) return ExitCode.PARTIAL;
+  if (diags.some((d) => d.code === "PARTIAL_APPLY")) return ExitCode.PARTIAL;
+
+  // Diagnostic-specific code mappings take priority over outcome mappings.
+  // (NOT_BOUND must resolve before outcome==="refused" → CONFLICT.)
+  if (diags.some((d) => d.code === "NOT_BOUND")) return ExitCode.PRECONDITION;
+  if (diags.some((d) => d.code === "USAGE")) return ExitCode.USAGE;
+  if (diags.some((d) => d.code === "UNIT_NOT_FOUND")) return ExitCode.USAGE;
+  if (diags.some((d) => d.code === "RUN_NOT_FOUND")) return ExitCode.USAGE;
+  if (diags.some((d) => d.code === "RUN_STATE_CORRUPT")) return ExitCode.CONFLICT;
+  if (diags.some((d) => d.code === "PLAN_DIGEST_DRIFT")) return ExitCode.CONFLICT;
+  if (diags.some((d) => d.code === "CHANGED_FILES_INVALID")) return ExitCode.CONFLICT;
+  if (diags.some((d) => d.code === "EXTERNAL_CHANGE")) return ExitCode.CONFLICT;
+  if (diags.some((d) => d.code === "RUNTIME_FAILURE")) return ExitCode.BD_FAILURE;
+  if (diags.some((d) => d.code === "READBACK_FAILURE")) return ExitCode.READBACK_FAILURE;
+  if (diags.some((d) => d.code === "BD_FAILURE")) return ExitCode.BD_FAILURE;
 
   // Binding drift / refused -> conflict.
   if (outcome === "binding_drift" || outcome === "refused" || outcome === "blocked") {
     return ExitCode.CONFLICT;
   }
 
-  // Read-back failure.
-  if (diagnostics.some((d) => d.code === "READBACK_FAILURE")) return ExitCode.READBACK_FAILURE;
-
-  // bd failure.
-  if (diagnostics.some((d) => d.code === "BD_FAILURE")) return ExitCode.BD_FAILURE;
+  // Run outcome mappings.
+  if (outcome === "failed") return ExitCode.PARTIAL;
+  if (outcome === "not_found") return ExitCode.USAGE;
 
   // Ordinary drift / issues_found / healthy / unchanged / bound / already_bound / applied.
   if (hasBlocking || hasError) return ExitCode.CONFLICT;

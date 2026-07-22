@@ -19,7 +19,6 @@
 //   - dep list --json       -> flat array of dependency records
 //   - dep add / dep remove  -> human text (no --json); classified by exit code
 
-import { spawn } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -351,6 +350,8 @@ export class BeadsClient {
     removeLabel?: string[];
     claim?: boolean;
     status?: string;
+    /** Assignee; empty string clears the assignee (requires --status to take effect). */
+    assignee?: string;
   }): Promise<BeadsIssue> {
     const args = ["update", issueId, "--json"];
     if (params.description) args.push("--description", params.description);
@@ -368,6 +369,7 @@ export class BeadsClient {
     }
     if (params.claim) args.push("--claim");
     if (params.status) args.push("--status", params.status);
+    if (params.assignee !== undefined) args.push("--assignee", params.assignee);
     const out = await this.runJson<BeadsIssue[] | BeadsIssue>(args);
     return Array.isArray(out) ? out[0]! : out;
   }
@@ -434,39 +436,56 @@ export class BeadsClient {
     opts: { cwd?: string; captureOnly?: boolean } = {},
   ): Promise<{ stdout: string; stderr: string; exitCode: number }> {
     await this.pace();
-    const { promise, resolve, reject } = Promise.withResolvers<{ stdout: string; stderr: string; exitCode: number }>();
-    const child = spawn(this.bdPath, args, {
-      cwd: opts.cwd ?? this.initCwd,
-      env: this.env,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    let stdout = "";
-    let stderr = "";
-    child.stdout.on("data", (d: Buffer) => {
-      stdout += d.toString();
-    });
-    child.stderr.on("data", (d: Buffer) => {
-      stderr += d.toString();
-    });
-    child.on("error", (err: NodeJS.ErrnoException) => {
-      if (err.code === "ENOENT") {
-        reject(
-          new BdError(
-            "bd_missing",
-            `bd binary not found at '${this.bdPath}' (ENOENT)`,
-            err.message,
-            null,
-            `bd ${args.join(" ")}`,
-          ),
+    // Use Bun.$ to avoid Bun's posix_spawn ENOENT bug that occurs after
+    // many process spawns in the same Bun process (Bun 1.3.x).
+    const cwd = opts.cwd ?? this.initCwd;
+    try {
+      const result = await Bun.$`${this.bdPath} ${args}`.cwd(cwd).env(this.env).quiet();
+      const stdout = result.stdout.toString();
+      const stderr = result.stderr.toString();
+      const exitCode = result.exitCode;
+      if (!opts.captureOnly && exitCode !== 0) {
+        throw new BdError(
+          "bd_failure",
+          `bd ${args.join(" ")} exited ${exitCode}: ${stderr.trim()}`,
+          stderr.trim(),
+          exitCode,
+          `bd ${args.join(" ")}`,
         );
-      } else {
-        reject(err);
       }
-    });
-    child.on("close", (code: number | null) => {
-      resolve({ stdout, stderr, exitCode: code ?? -1 });
-    });
-    return promise;
+      return { stdout, stderr, exitCode };
+    } catch (e) {
+      if (e instanceof BdError) throw e;
+      const err = e as { stdout?: Uint8Array; stderr?: Uint8Array; exitCode?: number; code?: string };
+      const stdout = err.stdout?.toString() ?? "";
+      const stderr = err.stderr?.toString() ?? (e as Error).message;
+      const exitCode = err.exitCode ?? -1;
+      // Check for bd binary not found (ENOENT via spawn, "command not found" via Bun.$).
+      if (
+        err.code === "ENOENT" ||
+        stderr.includes("ENOENT") ||
+        (e as Error).message.includes("ENOENT") ||
+        (exitCode === 1 && stderr.includes("command not found"))
+      ) {
+        throw new BdError(
+          "bd_missing",
+          `bd binary not found at '${this.bdPath}' (ENOENT${exitCode === 1 && stderr.includes("command not found") ? "/command-not-found" : ""})`,
+          (e as Error).message,
+          exitCode,
+          `bd ${args.join(" ")}`,
+        );
+      }
+      if (!opts.captureOnly && exitCode !== 0) {
+        throw new BdError(
+          "bd_failure",
+          `bd ${args.join(" ")} exited ${exitCode}: ${stderr.trim()}`,
+          stderr.trim(),
+          exitCode,
+          `bd ${args.join(" ")}`,
+        );
+      }
+      return { stdout, stderr, exitCode };
+    }
   }
 
   /** Enforce the minimum inter-invocation delay (KTD: embedded Dolt NBS race). */

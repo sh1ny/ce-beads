@@ -124,7 +124,7 @@ async function bindAction(args: CliArgs): Promise<ProtocolEnvelope> {
 
 // --- Binding enumeration (KTD8, KTD9) --------------------------------------
 
-async function enumerateBinding(client: BeadsClient, planPath: string): Promise<BindingState> {
+export async function enumerateBinding(client: BeadsClient, planPath: string): Promise<BindingState> {
   // Find the epic by metadata (KTD8).
   const epics = await client.list({
     all: true,
@@ -410,7 +410,7 @@ async function handleIndeterminateApply(
 
 // --- Helpers ---------------------------------------------------------------
 
-function buildMapping(plan: CePlan, binding: BindingState): Record<string, string> {
+export function buildMapping(plan: CePlan, binding: BindingState): Record<string, string> {
   const mapping: Record<string, string> = {};
   for (const task of binding.tasks) {
     const unitId = task.metadata?.ce_unit_id;

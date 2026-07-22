@@ -28,6 +28,33 @@ export type ArtifactReadiness = "implementation-ready";
 /** Supported execution mode. Only code plans are bridged. */
 export type Execution = "code";
 
+/**
+ * One row from a plan-level Verification Contract table (R8).
+ *
+ * `unit_id` is the U-ID the row applies to (a row may apply to multiple
+ * U-IDs and is fanned out into one entry per U-ID); `command` is the
+ * shell command the coordinator runs pre- and post-merge for that unit;
+ * `expected` is the optional free-form "Proves" / "Expected" text from
+ * the table (never executed).
+ */
+export interface VerificationEntry {
+  unit_id: string;
+  command: string;
+  expected?: string;
+}
+
+/** A parsed requirement definition (R-ID -> text). */
+export interface RequirementDefinition {
+  id: string;
+  text: string;
+}
+
+/** A parsed key technical decision, identified by KTD-ID. */
+export interface KtdDefinition {
+  id: string;
+  text: string;
+}
+
 /** A single CE implementation unit, fully typed. No `any`. */
 export interface CeUnit {
   /** Stable U-ID, e.g. "U1". */
@@ -47,6 +74,12 @@ export interface CeUnit {
   patterns: string[];
   testScenarios: string[];
   verification: string[];
+  /**
+   * Key technical decisions (KTDs) excerpted for this unit, selected by
+   * matching R-IDs that appear in the decision text against the unit's
+   * `requirements`. Empty when no KTD references apply.
+   */
+  ktd_excerpts: { id: string; text: string }[];
 }
 
 /** A parsed CE plan. Immutable input to downstream units. */
@@ -61,6 +94,18 @@ export interface CePlan {
   readiness: ArtifactReadiness;
   execution: Execution;
   units: CeUnit[];
+  /**
+   * Parsed Verification Contract table (R8). Each row is fanned out so
+   * one entry exists per U-ID the row applies to. Empty when the plan has
+   * no Verification Contract table, in which case pre-merge verification
+   * is a no-op pass for every unit.
+   */
+  verification_commands: VerificationEntry[];
+  /**
+   * Parsed requirement definitions (R-ID -> text) from the Product
+   * Contract's `### Requirements` section. Empty when missing.
+   */
+  requirement_defs: RequirementDefinition[];
 }
 
 /** Structured parse/rejection error carrying a stable diagnostic code. */
@@ -145,10 +190,16 @@ export function parsePlan(planPath: string, opts: ParseOptions = {}): CePlan {
   // Validate artifact contract literally (no aliasing).
   const fm = parseFrontmatter(frontmatter, canonical.relative);
   validateContract(fm, canonical.relative);
+  // Parse plan-level sections once (R8).
+  const ktds = parseKtdDefinitions(body);
+  const requirementDefs = parseRequirementDefinitions(body);
+  const verificationCommands = parseVerificationContract(body);
 
-  // Extract and validate units.
+  // Extract and validate units. KTDs are threaded into parseUnits so each
+  // unit's `ktd_excerpts` is selected from the plan-level KTD list using its
+  // own `requirements`.
   const title = extractTitle(body, fm);
-  const units = parseUnits(body, canonical.relative);
+  const units = parseUnits(body, ktds, canonical.relative);
 
   return {
     path: canonical.relative,
@@ -158,9 +209,10 @@ export function parsePlan(planPath: string, opts: ParseOptions = {}): CePlan {
     readiness: "implementation-ready",
     execution: "code",
     units,
+    verification_commands: verificationCommands,
+    requirement_defs: requirementDefs,
   };
 }
-
 /**
  * Canonical repo-relative plan path (forward slashes) for a given input.
  * Throws {@link PlanParseError} with code `PATH_OUTSIDE_REPO` if the resolved
@@ -329,7 +381,11 @@ interface RawUnit {
   body: string[]; // lines belonging to this unit, up to the next unit/heading.
 }
 
-function parseUnits(body: string, relPath: string): CeUnit[] {
+function parseUnits(
+  body: string,
+  ktds: KtdDefinition[],
+  relPath: string,
+): CeUnit[] {
   const lines = body.split(/\r?\n/);
   const raw: RawUnit[] = [];
   let current: RawUnit | null = null;
@@ -360,7 +416,7 @@ function parseUnits(body: string, relPath: string): CeUnit[] {
     );
   }
 
-  const units = raw.map((ru) => parseUnitFields(ru, relPath));
+  const units = raw.map((ru) => parseUnitFields(ru, ktds, relPath));
 
   // Validate unique U-IDs.
   validateUniqueIds(units, relPath);
@@ -372,7 +428,11 @@ function parseUnits(body: string, relPath: string): CeUnit[] {
   return units;
 }
 
-function parseUnitFields(ru: RawUnit, relPath: string): CeUnit {
+function parseUnitFields(
+  ru: RawUnit,
+  ktds: KtdDefinition[],
+  relPath: string,
+): CeUnit {
   const fields = extractBoldLabelFields(ru.body, ru.id, relPath);
 
   // Required fields present.
@@ -418,6 +478,22 @@ function parseUnitFields(ru: RawUnit, relPath: string): CeUnit {
     patterns,
     testScenarios,
     verification,
+    ktd_excerpts: selectKtdExcerptsForUnit(
+      {
+        id: ru.id,
+        title: ru.title,
+        goal,
+        requirements,
+        dependencies,
+        files,
+        approach,
+        patterns,
+        testScenarios,
+        verification,
+        ktd_excerpts: [],
+      },
+      ktds,
+    ),
   };
 
   // Optional fields: present only when the label appears; absent (not "") when
@@ -556,6 +632,265 @@ function parseBulletList(raw: string, _unitId: string): string[] {
     if (t !== "" && t !== "—") items.push(t);
   }
   return items;
+}
+
+// --- Plan-level extraction (R8) ------------------------------------------
+
+/**
+ * Index a markdown body by H2 (`## `) and H3 (`### `) headings so callers can
+ * look up a section's lines without scanning the document each time. Empty
+ * when the heading is missing. Section H2 lines are returned verbatim so
+ * callers can detect the end of one section and the start of the next.
+ */
+interface MarkdownSection {
+  /** Heading line as it appears in the body (e.g. "## Product Contract"). */
+  heading: string;
+  /** Heading level: 2 for H2, 3 for H3. */
+  level: 2 | 3;
+  /** Lines AFTER the heading, up to (not including) the next H2/H3. */
+  body: string[];
+}
+
+function splitMarkdownSections(body: string): MarkdownSection[] {
+  const lines = body.split(/\r?\n/);
+  const sections: MarkdownSection[] = [];
+  let current: MarkdownSection | null = null;
+  for (const line of lines) {
+    const h2 = line.match(/^##\s+(?!#)(.+?)\s*$/);
+    const h3 = line.match(/^###\s+(?!#)(.+?)\s*$/);
+    if (h2) {
+      if (current) sections.push(current);
+      current = { heading: line, level: 2, body: [] };
+      continue;
+    }
+    if (h3) {
+      if (current) sections.push(current);
+      current = { heading: line, level: 3, body: [] };
+      continue;
+    }
+    if (current) current.body.push(line);
+  }
+  if (current) sections.push(current);
+  return sections;
+}
+
+function findH2(sections: MarkdownSection[], headingRe: RegExp): MarkdownSection | null {
+  for (const s of sections) {
+    if (s.level === 2 && headingRe.test(s.heading)) return s;
+  }
+  return null;
+}
+
+/**
+ * Find an H3 section inside an H2 parent. `parentHeadingRe` is required
+ * (callers always constrain scope) so the function cannot accidentally
+ * match a duplicate H3 in a different top-level section.
+ */
+function findSection(
+  sections: MarkdownSection[],
+  headingRe: RegExp,
+  parentHeadingRe: RegExp,
+): MarkdownSection | null {
+  let insideParent = false;
+  for (const s of sections) {
+    if (s.level === 2) {
+      insideParent = parentHeadingRe.test(s.heading);
+      continue;
+    }
+    if (s.level === 3 && insideParent && headingRe.test(s.heading)) {
+      return s;
+    }
+  }
+  return null;
+}
+
+/**
+ * Parse a block of `- <ID>. text...` bullets where `<ID>` matches
+ * `R\d+`, `KTD\d+`, or `U\d+`. Continuation lines that are not
+ * themselves bullets belong to the previous bullet until the next bullet
+ * or a blank line. Sub-category bold paragraphs (e.g.
+ * `**Parsing and validation**`) are silently ignored because they do not
+ * match the bullet regex.
+ */
+function parseIdBulletBlock(body: string[]): { id: string; text: string }[] {
+  const out: { id: string; text: string }[] = [];
+  let current: { id: string; text: string[] } | null = null;
+  const flush = (): void => {
+    if (current === null) return;
+    const text = current.text.join("\n").replace(/\s+/g, " ").trim();
+    if (current.id !== "" && text !== "") {
+      out.push({ id: current.id, text });
+    }
+    current = null;
+  };
+  for (const raw of body) {
+    const line = raw.trim();
+    if (line === "") {
+      // Blank line ends the current bullet but keeps the accumulator so we
+      // can pick up the next bullet after category headers like
+      // "**Parsing and validation**".
+      flush();
+      continue;
+    }
+    const m = line.match(/^[-*]\s+(.+)$/);
+    if (m) {
+      const inner = m[1] ?? "";
+      const idm = inner.match(/^((?:KTD|R|U)\d+)\.\s*(.*)$/);
+      flush();
+      if (idm && idm[1]) {
+        current = { id: idm[1], text: idm[2] ? [idm[2]] : [] };
+      }
+      continue;
+    }
+    if (current) {
+      current.text.push(line);
+    }
+  }
+  flush();
+  return out;
+}
+
+/**
+ * Extract R-ID -> text definitions from `## Product Contract` ->
+ * `### Requirements`. Empty when either is missing. Tolerates sub-category
+ * bold paragraphs (e.g. `**Parsing and validation**`) interleaved between
+ * bullets.
+ */
+function parseRequirementDefinitions(body: string): RequirementDefinition[] {
+  const sections = splitMarkdownSections(body);
+  const requirements = findSection(
+    sections,
+    /^###\s+Requirements\s*$/i,
+    /^##\s+Product Contract\s*$/i,
+  );
+  if (!requirements) return [];
+  return parseIdBulletBlock(requirements.body);
+}
+
+/**
+ * Extract KTD-ID -> text from `## Planning Contract` ->
+ * `### Key Technical Decisions`. Empty when either is missing.
+ */
+function parseKtdDefinitions(body: string): KtdDefinition[] {
+  const sections = splitMarkdownSections(body);
+  const ktds = findSection(
+    sections,
+    /^###\s+Key Technical Decisions\s*$/i,
+    /^##\s+Planning Contract\s*$/i,
+  );
+  if (!ktds) return [];
+  return parseIdBulletBlock(ktds.body);
+}
+
+/**
+ * Select the KTDs relevant to a unit by intersecting each KTD's referenced
+ * R-IDs (e.g. `KTD10's text mentions "R10"`) against the unit's
+ * `requirements`. If a unit has no requirements, no KTDs are selected.
+ */
+function selectKtdExcerptsForUnit(
+  unit: CeUnit,
+  ktds: KtdDefinition[],
+): { id: string; text: string }[] {
+  if (ktds.length === 0 || unit.requirements.length === 0) return [];
+  const want = new Set(unit.requirements);
+  const result: { id: string; text: string }[] = [];
+  for (const k of ktds) {
+    // Splitting on word boundaries avoids matching "R1" inside "R10" or
+    // random "R" characters; KTDs reference R-IDs with plain ASCII digits.
+    const refs = new Set(k.text.match(/\bR\d+\b/g) ?? []);
+    let hits = 0;
+    for (const id of want) {
+      if (refs.has(id)) hits++;
+    }
+    if (hits > 0) result.push({ id: k.id, text: k.text });
+  }
+  return result;
+}
+
+/**
+ * Parse a markdown table. Returns the header (lower-cased, trimmed) and the
+ * rows (each as trimmed cells). Returns `null` when no table is found.
+ * Tolerates the optional leading `|` and trailing `|` common in GFM.
+ */
+function parseMarkdownTable(
+  body: string[],
+): { header: string[]; rows: string[][] } | null {
+  let i = 0;
+  // Skip blank lines above the table.
+  while (i < body.length && body[i]?.trim() === "") i++;
+  if (i >= body.length) return null;
+  const headerLine = body[i];
+  const sepLine = body[i + 1];
+  if (
+    headerLine === undefined ||
+    sepLine === undefined ||
+    !/^\s*\|.*\|\s*$/.test(headerLine) ||
+    !/^\s*\|?\s*:?-{3,}/.test(sepLine)
+  ) {
+    return null;
+  }
+  const splitRow = (line: string): string[] =>
+    line
+      .trim()
+      .replace(/^\|/, "")
+      .replace(/\|$/, "")
+      .split("|")
+      .map((c) => c.trim());
+  const header = splitRow(headerLine).map((h) => h.toLowerCase());
+  const rows: string[][] = [];
+  let j = i + 2;
+  while (j < body.length) {
+    const line = body[j];
+    if (line === undefined) break;
+    if (!/^\s*\|.*\|\s*$/.test(line)) break;
+    rows.push(splitRow(line));
+    j++;
+  }
+  return { header, rows };
+}
+
+/**
+ * Parse the plan-level `## Verification Contract` table (R8) into typed
+ * entries. Rows are fanned out by comma-separated U-IDs. Empty when the
+ * section is missing or contains no table.
+ */
+function parseVerificationContract(body: string): VerificationEntry[] {
+  const sections = splitMarkdownSections(body);
+  const vc = findH2(sections, /^##\s+Verification Contract\s*$/i);
+  if (!vc) return [];
+  const table = parseMarkdownTable(vc.body);
+  if (!table) return [];
+  const { header, rows } = table;
+  const uIdIdx = header.findIndex((h) => /^(u-?id|unit|units|for|applies(\s*to)?)$/i.test(h));
+  const cmdIdx = header.findIndex((h) =>
+    /^(command|procedure|test|test\s+command|command\s*\/\s*procedure)$/i.test(h),
+  );
+  const expIdx = header.findIndex((h) =>
+    /^(proves|expected|expected\s+output|should\s+produce|gate)$/i.test(h),
+  );
+  if (uIdIdx === -1 || cmdIdx === -1) return [];
+  const out: VerificationEntry[] = [];
+  for (const row of rows) {
+    const uRaw = row[uIdIdx] ?? "";
+    const rawCmd = row[cmdIdx] ?? "";
+    if (uRaw.trim() === "" || rawCmd.trim() === "") continue;
+    const cmd = rawCmd.replace(/^`+/, '').replace(/`+$/, '').trim();
+    const expected = expIdx === -1 ? undefined : (row[expIdx] ?? "").trim();
+    const uIds = uRaw
+      .split(/[,\s]+|\s+and\s+/i)
+      .map((s) => s.trim())
+      .filter((s) => /^U\d+$/.test(s));
+    if (uIds.length === 0) continue;
+    const baseExpected = expected !== undefined && expected !== "" ? expected : undefined;
+    for (const uId of uIds) {
+      if (baseExpected === undefined) {
+        out.push({ unit_id: uId, command: cmd });
+      } else {
+        out.push({ unit_id: uId, command: cmd, expected: baseExpected });
+      }
+    }
+  }
+  return out;
 }
 
 // --- Validation ------------------------------------------------------------
