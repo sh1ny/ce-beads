@@ -239,6 +239,18 @@ export class RunEngine {
       ]);
     }
 
+    // Refuse resume for terminal run states — the work was explicitly
+    // released (abandoned), cleaned up (reaped), or finished (completed).
+    if (state.status === "abandoned" || state.status === "reaped" || state.status === "completed") {
+      return envelope("run", false, "refused", null, [
+        {
+          code: "RUN_ACTIVE",
+          severity: "blocking",
+          message: `Run ${runId} is in terminal state "${state.status}" and cannot be resumed.`,
+        },
+      ]);
+    }
+
     // If blocked and no retry, return immediately.
     if (state.status === "blocked" && !opts?.retry) {
       return this.statusEnvelope(state, "blocked");

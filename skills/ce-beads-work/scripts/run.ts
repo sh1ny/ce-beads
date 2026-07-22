@@ -8,7 +8,7 @@
 //   ce-beads run reap <run-id> [--force] [--apply <token>]
 //   ce-beads run abandon <run-id> [--apply <token>]
 
-import { join, resolve } from "node:path";
+import { join } from "node:path";
 import type { CliArgs, ActionHandler } from "../../ce-beads/scripts/cli.ts";
 import { LockHolder } from "../../ce-beads/scripts/cli.ts";
 import {
@@ -170,7 +170,11 @@ async function withPlanLock(
   repoRoot: string,
   fn: () => Promise<ProtocolEnvelope>,
 ): Promise<ProtocolEnvelope> {
-  const lock = new LockHolder(resolve(planPath), repoRoot);
+  // Use the same key as bind/sync: parsePlan normalizes to a repo-relative
+  // path, and LockHolder hashes `${repoRoot}::${planPath}`. Resolving to
+  // absolute here would produce a different hash and fail to serialize
+  // against bind/sync (ce-beads-thread-SwjDM).
+  const lock = new LockHolder(planPath, repoRoot);
   const acquired = await lock.tryAcquire();
   if (!acquired) {
     return envelope("run", false, "refused", null, [
