@@ -4,6 +4,7 @@
 // exercise the identical commit/integration path.
 
 import { existsSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { mkdir, rm, writeFile, readFile } from "node:fs/promises";
 import { join, sep, basename } from "node:path";
 import type { CePlan, CeUnit, VerificationEntry } from "../../ce-beads/scripts/plan-parser.ts";
@@ -686,6 +687,51 @@ export class RunEngine {
           // Invalid result file — fall through to clear and relaunch.
         }
       }
+      // If prompt was already sent (crash during wait), don't relaunch —
+      // reconstruct the handle and wait for the existing worker's result
+      // (ce-beads-thread-Sya30, P1).
+      if (record.prompt_lifecycle === "sent" && record.worker_pane_id) {
+        const existingHandle: WorkerHandle = {
+          paneId: record.worker_pane_id,
+          workspace: ws,
+          resultFile: join(ws.worktreePath, WORKER_RESULT_FILE),
+          startedAt: record.claimed_at ?? "",
+          promptLifecycle: "sent",
+        };
+        const waitResult: WorkerResult = await this.runtime.wait(existingHandle, {
+          timeoutMs: this.workerTimeoutMs,
+        });
+        if (waitResult.kind === "completed") {
+          const report = waitResult.report;
+          if (report.u_id !== unitId) {
+            state.status = "blocked";
+            return this.blockUnit(state, client, record, unitId, "claimed", {
+              code: "WORKER_REPORT_INVALID",
+              severity: "blocking",
+              message: `Worker report u_id "${report.u_id}" does not match unit "${unitId}".`,
+            });
+          }
+          record.result = report;
+          if (report.status === "complete") {
+            record.state = "worker_finished";
+            record.last_successful_state = "claimed";
+            await client.update(beadsId, {
+              setMetadata: { ce_beads_run_state: "worker_finished" },
+              addLabel: ["ce-beads:worker-finished"],
+            });
+            saveRunState(state, this.repoRoot);
+            return { kind: "finished" };
+          }
+          state.status = report.status === "blocked" ? "blocked" : "failed";
+          return this.blockUnit(state, client, record, unitId, "claimed", {
+            code: report.status === "blocked" ? "WORKER_BLOCKED" : "WORKER_FAILED",
+            severity: "blocking",
+            message: `Worker ${report.status} for ${unitId}: ${report.blockers || "worker reported failure"}`,
+          });
+        }
+        // timeout or died — fall through to clear and relaunch.
+        state.status = waitResult.kind === "timeout" ? "blocked" : "failed";
+      }
       // Clear any stale/invalid result file from a previous attempt (R3).
       await rm(resultFile, { force: true });
     } else {
@@ -1268,24 +1314,18 @@ export interface AbandonPreview {
   entries: AbandonEntry[];
 }
 
-// --- Token helpers (simple stable hashes over the preview JSON) -------------
+// --- Token helpers (SHA-256 over the preview JSON) -----------------------
 
 function reapToken(preview: ReapPreview): string {
-  return stableHash(JSON.stringify(preview));
+  return sha256Hex(JSON.stringify(preview));
 }
 
 function abandonToken(preview: AbandonPreview): string {
-  return stableHash(JSON.stringify(preview));
+  return sha256Hex(JSON.stringify(preview));
 }
 
-function stableHash(input: string): string {
-  // FNV-1a 32-bit, hex — deterministic, no crypto dependency needed.
-  let h = 0x811c9dc5;
-  for (let i = 0; i < input.length; i++) {
-    h ^= input.charCodeAt(i);
-    h = Math.imul(h, 0x01000193);
-  }
-  return (h >>> 0).toString(16).padStart(8, "0");
+function sha256Hex(input: string): string {
+  return createHash("sha256").update(input, "utf8").digest("hex");
 }
 
 // --- Process helpers -------------------------------------------------------

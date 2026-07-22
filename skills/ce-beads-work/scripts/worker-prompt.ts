@@ -6,7 +6,8 @@
 // constant and the agent file.
 
 import { readFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { WorkerPacket } from "./worker-packet.ts";
 
 /**
@@ -15,7 +16,11 @@ import type { WorkerPacket } from "./worker-packet.ts";
  * never duplicates the prompt text.
  */
 export function getWorkerAgentBody(): string {
-  const agentPath = join(process.cwd(), "agents", "ce-beads-unit.md");
+  // Resolve relative to this module's location, not process.cwd(), so it
+  // works when ce-beads is installed as a plugin in a consumer repo
+  // (ce-beads-thread-Sya34, P1).
+  const moduleDir = dirname(fileURLToPath(import.meta.url));
+  const agentPath = join(moduleDir, "..", "..", "..", "agents", "ce-beads-unit.md");
   const raw = readFileSync(agentPath, "utf8");
   // Strip YAML frontmatter (--- ... ---) if present.
   const stripped = raw.replace(/^---[\s\S]*?---\s*\n/, "");

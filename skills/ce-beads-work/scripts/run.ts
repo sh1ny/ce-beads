@@ -11,6 +11,7 @@
 import { join } from "node:path";
 import type { CliArgs, ActionHandler } from "../../ce-beads/scripts/cli.ts";
 import { LockHolder } from "../../ce-beads/scripts/cli.ts";
+import { resolvePlanPath } from "../../ce-beads/scripts/plan-parser.ts";
 import {
   envelope,
   type ProtocolEnvelope,
@@ -92,7 +93,17 @@ async function runAction(args: CliArgs): Promise<ProtocolEnvelope> {
         ]);
       }
       const once = args.once === true;
-      return withPlanLock(planPath, repoRoot, () => engine.start(planPath, { once }));
+      // Canonicalize the plan path so the lock key matches bind/sync
+      // (which use plan.path from parsePlan) regardless of whether the
+      // user passed ./plan.md or plan.md (ce-beads-thread-Sya38).
+      let canonicalPath = planPath;
+      try {
+        const resolved = resolvePlanPath(planPath, repoRoot);
+        canonicalPath = resolved.relative;
+      } catch {
+        // If path resolution fails, the engine will report the error.
+      }
+      return withPlanLock(canonicalPath, repoRoot, () => engine.start(planPath, { once }));
     }
     case "status": {
       const runId = positional[2] as string | undefined;

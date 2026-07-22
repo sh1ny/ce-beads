@@ -102,7 +102,9 @@ export class HerdrRuntime implements AgentRuntime {
 
   async startWorkerPhase2(handle: WorkerHandle, prompt: string): Promise<void> {
     const ws = handle.workspace;
-    const agentName = `ce-beads-${ws.unitId}`;
+    // Include the branch slug (which contains unit ID + run ID) in the
+    // agent name to avoid collisions across runs (ce-beads-thread-Sya3_).
+    const agentName = `ce-beads-${ws.branch.replace(/\//g, "-")}`;
     const disposableBeadsDir = await mkdtemp(join(tmpdir(), "ce-beads-worker-"));
 
     const argv: string[] = [
